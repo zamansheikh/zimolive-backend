@@ -9,6 +9,7 @@ import { InjectModel } from '@nestjs/mongoose';
 import { FilterQuery, Model, Types } from 'mongoose';
 
 import { MediaService } from '../media/media.service';
+import { User, UserDocument } from '../users/schemas/user.schema';
 import {
   CommentStatus,
   MomentComment,
@@ -41,6 +42,7 @@ export class MomentsService {
     private readonly likeModel: Model<MomentLikeDocument>,
     @InjectModel(MomentComment.name)
     private readonly commentModel: Model<MomentCommentDocument>,
+    @InjectModel(User.name) private readonly userModel: Model<UserDocument>,
     private readonly media: MediaService,
   ) {}
 
@@ -172,6 +174,95 @@ export class MomentsService {
       );
     }
 
+    // Recent reactors preview — top 3 most recent likes per moment, with
+    // user info hydrated. Drives the avatar rollup on the feed card.
+    // Single aggregation across the whole page so we don't N+1 the
+    // like collection: $sort by createdAt desc, $group → first 3 per
+    // moment, then $lookup the user docs.
+    const recentReactorsByMoment = new Map<
+      string,
+      Array<{
+        userId: string;
+        kind: ReactionKind;
+        user: {
+          id: string;
+          displayName: string;
+          username: string;
+          avatarUrl: string;
+          numericId: number | null;
+        } | null;
+      }>
+    >();
+    if (momentIds.length > 0) {
+      const recents = await this.likeModel
+        .aggregate<{
+          _id: Types.ObjectId;
+          reactors: Array<{
+            userId: Types.ObjectId;
+            kind: ReactionKind;
+            createdAt: Date;
+          }>;
+        }>([
+          { $match: { momentId: { $in: momentIds } } },
+          { $sort: { createdAt: -1 } },
+          {
+            $group: {
+              _id: '$momentId',
+              reactors: {
+                $push: {
+                  userId: '$userId',
+                  kind: '$kind',
+                  createdAt: '$createdAt',
+                },
+              },
+            },
+          },
+          {
+            $project: {
+              reactors: { $slice: ['$reactors', 3] },
+            },
+          },
+        ])
+        .exec();
+      // Collect every userId we need to hydrate, do one $in lookup.
+      const userIds = new Set<string>();
+      for (const r of recents) {
+        for (const x of r.reactors) userIds.add(x.userId.toString());
+      }
+      const userDocs = userIds.size
+        ? await this.userModel
+            .find({
+              _id: { $in: Array.from(userIds).map((s) => new Types.ObjectId(s)) },
+            })
+            .select('username displayName avatarUrl numericId')
+            .lean()
+            .exec()
+        : [];
+      const userMap = new Map<string, (typeof userDocs)[number]>();
+      for (const u of userDocs) userMap.set(u._id.toString(), u);
+      for (const r of recents) {
+        recentReactorsByMoment.set(
+          r._id.toString(),
+          r.reactors.map((x) => {
+            const u = userMap.get(x.userId.toString());
+            return {
+              userId: x.userId.toString(),
+              kind: x.kind ?? ReactionKind.LIKE,
+              user: u
+                ? {
+                    id: u._id.toString(),
+                    displayName: u.displayName ?? '',
+                    username: u.username ?? '',
+                    avatarUrl: u.avatarUrl ?? '',
+                    numericId: u.numericId ?? null,
+                  }
+                : null,
+            };
+          }),
+        );
+      }
+    }
+
     const annotated = items.map((m) => {
       const json = m.toJSON() as Record<string, unknown>;
       const id = m._id.toString();
@@ -180,6 +271,7 @@ export class MomentsService {
       json.likedByMe = my != null;
       json.reactionCounts =
         reactionsByMoment.get(id) ?? this.emptyReactionBucket();
+      json.recentReactors = recentReactorsByMoment.get(id) ?? [];
       return json;
     });
 
@@ -198,6 +290,68 @@ export class MomentsService {
       [ReactionKind.SAD]: 0,
       [ReactionKind.ANGRY]: 0,
     };
+  }
+
+  /**
+   * Paginated reactors list — drives the bottom-sheet that opens when
+   * the user taps the avatar rollup on a feed card. Newest reactor
+   * first, with each user's display info + the kind they picked.
+   */
+  async listReactors(
+    momentId: string,
+    params: { page?: number; limit?: number },
+  ) {
+    if (!Types.ObjectId.isValid(momentId)) {
+      throw new BadRequestException({
+        code: 'INVALID_MOMENT_ID',
+        message: 'Invalid moment id',
+      });
+    }
+    const page = Math.max(1, params.page ?? 1);
+    const limit = Math.min(100, Math.max(1, params.limit ?? 30));
+    const skip = (page - 1) * limit;
+
+    const filter = { momentId: new Types.ObjectId(momentId) };
+    const [items, total] = await Promise.all([
+      this.likeModel
+        .find(filter)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .populate(
+          'userId',
+          'username displayName avatarUrl numericId level isHost',
+        )
+        .lean()
+        .exec(),
+      this.likeModel.countDocuments(filter).exec(),
+    ]);
+
+    const rows = items.map((l) => {
+      const u = l.userId as unknown as {
+        _id: Types.ObjectId;
+        username?: string;
+        displayName?: string;
+        avatarUrl?: string;
+        numericId?: number | null;
+        level?: number | null;
+      } | null;
+      return {
+        userId: u?._id.toString() ?? '',
+        kind: l.kind ?? ReactionKind.LIKE,
+        user: u
+          ? {
+              id: u._id.toString(),
+              displayName: u.displayName ?? '',
+              username: u.username ?? '',
+              avatarUrl: u.avatarUrl ?? '',
+              numericId: u.numericId ?? null,
+              level: u.level ?? 1,
+            }
+          : null,
+      };
+    });
+    return { items: rows, page, limit, total };
   }
 
   // ============== Reactions ==============

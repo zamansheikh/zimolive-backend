@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 
+import { User, UserSchema } from '../users/schemas/user.schema';
 import { MomentsAdminController } from './moments-admin.controller';
 import { MomentsController } from './moments.controller';
 import { MomentsService } from './moments.service';
@@ -17,6 +18,9 @@ import { Moment, MomentSchema } from './schemas/moment.schema';
       { name: Moment.name, schema: MomentSchema },
       { name: MomentLike.name, schema: MomentLikeSchema },
       { name: MomentComment.name, schema: MomentCommentSchema },
+      // Read-only access to User for hydrating recent-reactor previews
+      // on the feed. Full UsersModule isn't imported to avoid coupling.
+      { name: User.name, schema: UserSchema },
     ]),
   ],
   controllers: [MomentsController, MomentsAdminController],

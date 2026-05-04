@@ -162,6 +162,19 @@ export class MomentsController {
     return this.moments.unlike(id, current.userId);
   }
 
+  /** Paginated list of users who have reacted to this moment. Drives
+   *  the "Who liked this" sheet on the feed card. Newest reactor
+   *  first. Each row carries the user's display info + their kind. */
+  @UseGuards(JwtAuthGuard)
+  @Get(':id/reactors')
+  async listReactors(
+    @Param('id') id: string,
+    @Query('page') page?: number,
+    @Query('limit') limit?: number,
+  ) {
+    return this.moments.listReactors(id, { page, limit });
+  }
+
   // ---------- Legacy like endpoints (back-compat with old clients) ----------
 
   @UseGuards(JwtAuthGuard)
