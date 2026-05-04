@@ -59,6 +59,15 @@ export enum RealtimeEventType {
    *  `slotsTaken === slotCount`, retire the floating card. */
   ROOM_LUCKY_BAG_CLAIMED = 'room.lucky_bag.claimed',
 
+  /** A seated user fired an emoji reaction over their seat tile.
+   *  Payload:
+   *  `{ seatIndex, userId, emoji: { id, name, type, assetUrl?, char? }, durationMs }`.
+   *  Receivers render the emoji as a transient overlay on the matching
+   *  seat for `durationMs` (default ~3s). Only seated users can fire; the
+   *  service rejects others with `NOT_SEATED`. Coalesces to the latest
+   *  reaction per seat — a fast double-tap replaces the prior overlay. */
+  ROOM_SEAT_EMOJI = 'room.seat.emoji',
+
   // ---------- Global ----------
   /** A rocket fired somewhere on the platform — banner everyone sees. */
   GLOBAL_ROCKET_BANNER = 'global.rocket.banner',
