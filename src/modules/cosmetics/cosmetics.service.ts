@@ -376,4 +376,134 @@ export class CosmeticsService {
     await this._bustEquippedCache(userId);
     return owned;
   }
+
+  /**
+   * Flip one user-cosmetic to `equipped: false`. Used by the My Items
+   * unequip button so the user can intentionally take off a frame /
+   * theme without having to equip a different one. Idempotent — a
+   * not-equipped row just touches no fields.
+   */
+  async unequip(userId: string, userCosmeticId: string): Promise<UserCosmeticDocument> {
+    const owned = await this.userCosmeticModel.findById(userCosmeticId).exec();
+    if (!owned || owned.userId.toString() !== userId) {
+      throw new NotFoundException('Cosmetic not owned');
+    }
+    if (owned.equipped) {
+      owned.equipped = false;
+      await owned.save();
+      await this._bustEquippedCache(userId);
+    }
+    return owned;
+  }
+
+  /**
+   * Equip every SVIP-granted cosmetic the user owns whose source tier
+   * is ≤ `level` (lower SVIP tiers stack — buying SVIP3 keeps SVIP1's
+   * benefits visible). For each cosmetic type seen across the granted
+   * set, the highest-tier item wins, and any other equipped item of
+   * the same type (store / gift / etc.) is automatically unequipped to
+   * preserve the "one per type" invariant.
+   *
+   * Returns the count of items flipped to equipped — useful for
+   * snackbars ("Equipped 5 SVIP cosmetics").
+   */
+  async equipSvipTier(userId: string, level: number): Promise<number> {
+    if (!Types.ObjectId.isValid(userId) || level <= 0) return 0;
+    const userOid = new Types.ObjectId(userId);
+    const now = new Date();
+
+    // Pull every SVIP-source cosmetic the user owns up to + including
+    // this tier, with the underlying item populated so we can pick by
+    // type. Excludes expired entries.
+    const owned = await this.userCosmeticModel
+      .find({
+        userId: userOid,
+        source: CosmeticSource.SVIP,
+        svipTier: { $ne: null, $lte: level },
+        $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }],
+      })
+      .populate('cosmeticItemId')
+      .exec();
+    if (owned.length === 0) return 0;
+
+    // Pick the winning item per type — highest svipTier wins. Ties
+    // broken by acquiredAt-desc so a re-grant at the same tier still
+    // resolves deterministically.
+    const winnerByType = new Map<string, UserCosmeticDocument>();
+    for (const row of owned) {
+      const item = row.cosmeticItemId as unknown as { type?: string } | null;
+      const type = item?.type;
+      if (!type) continue;
+      const incumbent = winnerByType.get(type);
+      if (!incumbent) {
+        winnerByType.set(type, row);
+        continue;
+      }
+      const a = row.svipTier ?? 0;
+      const b = incumbent.svipTier ?? 0;
+      if (a > b || (a === b && row.acquiredAt > incumbent.acquiredAt)) {
+        winnerByType.set(type, row);
+      }
+    }
+    if (winnerByType.size === 0) return 0;
+
+    const winnerIds = Array.from(winnerByType.values()).map((r) => r._id);
+    const types = Array.from(winnerByType.keys());
+
+    // Unequip every existing equipped row of these types — one
+    // sweeping `updateMany` covers both the SVIP losers (lower-tier
+    // items in the same type) and any non-SVIP items the user had
+    // equipped (store frame, gift theme, etc.).
+    const peerItemIds = await this.itemModel
+      .find({ type: { $in: types } }, { _id: 1 })
+      .exec();
+    await this.userCosmeticModel
+      .updateMany(
+        {
+          userId: userOid,
+          cosmeticItemId: { $in: peerItemIds.map((p) => p._id) },
+          equipped: true,
+        },
+        { $set: { equipped: false } },
+      )
+      .exec();
+
+    // Equip the winners.
+    await this.userCosmeticModel
+      .updateMany(
+        { _id: { $in: winnerIds } },
+        { $set: { equipped: true } },
+      )
+      .exec();
+
+    await this._bustEquippedCache(userId);
+    return winnerIds.length;
+  }
+
+  /**
+   * Unequip every cosmetic owned via `source` for this user. Used by
+   * SVIP `deactivate` to take the badge off — every SVIP-source
+   * cosmetic comes off too, so the user is back to whatever they had
+   * before activating (they can re-equip store items manually).
+   */
+  async unequipBySource(
+    userId: string,
+    source: CosmeticSource,
+  ): Promise<number> {
+    if (!Types.ObjectId.isValid(userId)) return 0;
+    const res = await this.userCosmeticModel
+      .updateMany(
+        {
+          userId: new Types.ObjectId(userId),
+          source,
+          equipped: true,
+        },
+        { $set: { equipped: false } },
+      )
+      .exec();
+    if ((res.modifiedCount ?? 0) > 0) {
+      await this._bustEquippedCache(userId);
+    }
+    return res.modifiedCount ?? 0;
+  }
 }

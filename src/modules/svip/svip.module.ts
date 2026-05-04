@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 
+import { CosmeticsModule } from '../cosmetics/cosmetics.module';
 import { WalletModule } from '../wallet/wallet.module';
 import { SvipAdminController } from './svip-admin.controller';
 import { SvipController } from './svip.controller';
@@ -22,6 +23,10 @@ import {
     // WalletModule has no dependency on SvipModule, so this arrow is
     // one-way.
     WalletModule,
+    // Tier purchases grant cosmetics; activate flips them on while
+    // overriding any non-SVIP item of the same type. Deactivate
+    // unequips them. Same one-way dependency arrow as wallet.
+    CosmeticsModule,
   ],
   controllers: [SvipAdminController, SvipController],
   providers: [SvipService],

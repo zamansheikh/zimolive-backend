@@ -9,6 +9,8 @@ import { InjectModel } from '@nestjs/mongoose';
 import { randomUUID } from 'crypto';
 import { Model, Types } from 'mongoose';
 
+import { CosmeticsService } from '../cosmetics/cosmetics.service';
+import { CosmeticSource } from '../cosmetics/schemas/user-cosmetic.schema';
 import { Currency, TxnType } from '../wallet/schemas/transaction.schema';
 import { WalletService } from '../wallet/wallet.service';
 import { SVIP_PRIVILEGES, PrivilegeDef } from './privileges.catalog';
@@ -22,6 +24,7 @@ export class SvipService {
     @InjectModel(UserSvipStatus.name)
     private readonly statusModel: Model<UserSvipStatusDocument>,
     private readonly wallet: WalletService,
+    private readonly cosmetics: CosmeticsService,
   ) {}
 
   // ---------- Privileges catalog ----------
@@ -242,10 +245,28 @@ export class SvipService {
     // gets bumped up to SVIP3).
     const owned = new Set([...(status.ownedLevels ?? []), level]);
     status.ownedLevels = Array.from(owned).sort((a, b) => a - b);
-    if (level > status.currentLevel) status.currentLevel = level;
+    const wasBumped = level > status.currentLevel;
+    if (wasBumped) status.currentLevel = level;
     if (level > status.highestLevel) status.highestLevel = level;
     status.expiresAt = expiresAt;
     await status.save();
+
+    // Grant the cosmetics tied to this tier so the user owns them in
+    // their inventory. We grant for tiers ≤ this one too (in case a
+    // user is buying SVIP3 first and bypasses lower-tier grants); the
+    // grant is idempotent at the DB layer.
+    await this._grantCosmeticsForOwnedTiers(
+      userId,
+      status.ownedLevels,
+      tier.durationDays > 0 ? tier.durationDays : null,
+    );
+
+    // If the purchase bumped them to a new active tier, auto-equip
+    // every SVIP cosmetic for the new currentLevel. Lower-tier
+    // owners can equip later via the activate endpoint.
+    if (wasBumped) {
+      await this.cosmetics.equipSvipTier(userId, status.currentLevel);
+    }
     return status;
   }
 
@@ -281,6 +302,19 @@ export class SvipService {
     }
     status.currentLevel = level;
     await status.save();
+
+    // Equip every SVIP-granted cosmetic for tiers ≤ the new active
+    // level. CosmeticsService handles "one per type" — if the user
+    // had a store-purchased frame on, the SVIP frame takes its place
+    // and the store row flips to unequipped. Defensive grant first
+    // in case the rows were never created (e.g. legacy purchases
+    // that pre-dated the auto-grant).
+    await this._grantCosmeticsForOwnedTiers(
+      userId,
+      status.ownedLevels,
+      null, // duration unknown at this point — extend doesn't shrink, so null is safe
+    );
+    await this.cosmetics.equipSvipTier(userId, level);
     return status;
   }
 
@@ -288,6 +322,10 @@ export class SvipService {
    * Hide the user's SVIP badge / privileges without giving up
    * ownership. They can re-activate any owned tier later. Setting
    * currentLevel = 0 is the canonical "no SVIP active" state.
+   *
+   * Also unequips every SVIP-source cosmetic so the user goes back
+   * to whatever non-SVIP look they had. Store / gift items don't
+   * auto-re-equip — the user picks what they want from My Items.
    */
   async deactivate(userId: string): Promise<UserSvipStatusDocument> {
     if (!Types.ObjectId.isValid(userId)) {
@@ -299,7 +337,44 @@ export class SvipService {
     const status = await this.getOrCreateStatus(userId);
     status.currentLevel = 0;
     await status.save();
+    await this.cosmetics.unequipBySource(userId, CosmeticSource.SVIP);
     return status;
+  }
+
+  /**
+   * Grant every cosmetic listed on the tiers in `ownedLevels` to the
+   * user, tagged with `source: SVIP` and the originating tier level.
+   * Idempotent at the DB layer (CosmeticsService.grantToUser dedupes
+   * via the unique index on user+item+source+externalRef), so it's
+   * safe to call from purchase AND activate.
+   */
+  private async _grantCosmeticsForOwnedTiers(
+    userId: string,
+    ownedLevels: number[],
+    durationDays: number | null,
+  ) {
+    if (ownedLevels.length === 0) return;
+    const tiers = await this.tierModel
+      .find({ level: { $in: ownedLevels }, active: true })
+      .exec();
+    for (const tier of tiers) {
+      for (const itemId of tier.grantedItemIds ?? []) {
+        try {
+          await this.cosmetics.grantToUser({
+            userId,
+            cosmeticItemId: itemId.toString(),
+            source: CosmeticSource.SVIP,
+            durationDays: durationDays ?? undefined,
+            svipTier: tier.level,
+            externalRef: `svip-tier-${tier.level}`,
+          });
+        } catch {
+          // Best-effort: a single bad item id shouldn't poison the
+          // whole tier activate. Failures get re-attempted on the
+          // next activate / purchase.
+        }
+      }
+    }
   }
 
   // ---------- helpers ----------

@@ -54,4 +54,20 @@ export class CosmeticsController {
     const cosmetic = await this.cosmetics.equip(current.userId, userCosmeticId);
     return { cosmetic };
   }
+
+  /**
+   * Take an item off without equipping a different one of the same
+   * type. Used by the My Items "Unequip" button. Idempotent.
+   */
+  @Post(':userCosmeticId/unequip')
+  async unequip(
+    @CurrentUser() current: AuthenticatedUser,
+    @Param('userCosmeticId') userCosmeticId: string,
+  ) {
+    const cosmetic = await this.cosmetics.unequip(
+      current.userId,
+      userCosmeticId,
+    );
+    return { cosmetic };
+  }
 }
