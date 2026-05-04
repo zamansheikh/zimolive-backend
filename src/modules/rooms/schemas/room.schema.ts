@@ -85,8 +85,10 @@ function refToId(v: unknown): unknown {
       ret.themeCosmeticId = refToId(ret.themeCosmeticId);
       delete ret._id;
       delete ret.__v;
-      // Don't leak the password hash.
+      // Don't leak the password hash or plaintext mirror — both are
+      // already `select: false`, this is belt-and-suspenders.
       delete ret.passwordHash;
+      delete ret.passwordPlain;
       return ret;
     },
   },
@@ -146,6 +148,17 @@ export class Room {
   /** bcrypt hash — empty string means no password. */
   @Prop({ type: String, default: '', select: false })
   passwordHash!: string;
+
+  /**
+   * Plaintext mirror of the room PIN. `select: false` so it never
+   * leaks into normal queries — the only reader is the owner-gated
+   * "reveal" endpoint, which is how the host re-sees the PIN they
+   * already chose to share with friends. PINs are 4 digits — low
+   * enough entropy that hashing + plaintext is a reasonable trade
+   * for the UX of showing it back.
+   */
+  @Prop({ type: String, default: '', select: false })
+  passwordPlain!: string;
 
   /**
    * Mirror of `passwordHash.length > 0` as a public boolean — kept

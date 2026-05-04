@@ -5,6 +5,7 @@ import {
   IsNotEmpty,
   IsOptional,
   IsString,
+  Matches,
   Max,
   MaxLength,
   Min,
@@ -74,12 +75,16 @@ export class UpdateRoomSettingsDto {
   micCount?: number;
 
   /**
-   * Empty string clears the password. Anything else is hashed and stored.
-   * Omitting the field entirely leaves the password unchanged.
+   * Numeric room PIN. Exactly 4 digits when set; empty string clears it.
+   * Omitting the field entirely leaves the password unchanged. Stored
+   * both as a bcrypt hash (for compare on enter) and a `select: false`
+   * plaintext mirror so the owner can re-view it from settings.
    */
   @IsOptional()
   @IsString()
-  @MaxLength(64)
+  @Matches(/^(|\d{4})$/, {
+    message: 'password must be a 4-digit PIN, or empty to clear',
+  })
   password?: string;
 
   /** Room cover picture URL. Empty string clears it (falls back to the

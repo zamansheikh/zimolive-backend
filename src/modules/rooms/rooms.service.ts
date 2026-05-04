@@ -425,13 +425,16 @@ export class RoomsService implements OnModuleInit {
       room.micCount = input.micCount;
     }
     if (input.password !== undefined) {
-      // Empty string = clear password; non-empty = hash + set. Mirror
-      // the boolean flag so listing endpoints can advertise locked
-      // rooms without selecting the hash.
+      // Empty string = clear password; non-empty (4-digit PIN) = hash
+      // + set. Also mirror the plaintext (select: false) so the owner
+      // can re-view it from settings, and the public boolean so list
+      // endpoints can advertise locked rooms without selecting the
+      // hash. The DTO already validated digits-only.
       room.passwordHash =
         input.password.length === 0
           ? ''
           : await bcrypt.hash(input.password, PASSWORD_BCRYPT_ROUNDS);
+      room.passwordPlain = input.password;
       room.hasPassword = input.password.length > 0;
     }
     if (input.coverUrl !== undefined) {
@@ -483,6 +486,24 @@ export class RoomsService implements OnModuleInit {
       },
     );
     return room;
+  }
+
+  /**
+   * Owner-only "reveal my room PIN". Returns the plaintext PIN that
+   * was last set via `updateSettings`, or empty string when the room
+   * has no password. The plaintext is stored alongside the bcrypt hash
+   * (both `select: false`) precisely for this read — the owner needs
+   * to share the PIN with friends and re-checking the value is
+   * cheaper than rotating it every time they forget.
+   */
+  async revealPassword(roomId: string, ownerId: string): Promise<string> {
+    await this.assertOwner(roomId, ownerId);
+    if (!Types.ObjectId.isValid(roomId)) return '';
+    const doc = await this.roomModel
+      .findById(roomId)
+      .select('+passwordPlain')
+      .exec();
+    return doc?.passwordPlain ?? '';
   }
 
   /** Add or remove guest seats when micCount changes. Never destroys an

@@ -148,6 +148,22 @@ export class RoomsController {
     return { room: room.toJSON() };
   }
 
+  /**
+   * Owner-only — reveal the room's plaintext PIN so the host can
+   * re-share it from the settings sheet. Service throws Forbidden
+   * for non-owners. Returns `{ password: '' }` when the room has no
+   * PIN, so the client can render a "set one" affordance.
+   */
+  @UseGuards(JwtAuthGuard)
+  @Get(':id/password')
+  async revealPassword(
+    @CurrentUser() current: AuthenticatedUser,
+    @Param('id') id: string,
+  ) {
+    const password = await this.rooms.revealPassword(id, current.userId);
+    return { password };
+  }
+
   // ---------- Enter / Leave ----------
 
   @UseGuards(JwtAuthGuard)
