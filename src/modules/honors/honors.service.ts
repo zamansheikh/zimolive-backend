@@ -18,7 +18,9 @@ import {
   HonorCategory,
   HonorItem,
   HonorItemDocument,
+  HonorMetric,
 } from './schemas/honor-item.schema';
+import { HonorMetricsService } from './metrics.service';
 import {
   HonorSource,
   UserHonor,
@@ -54,6 +56,7 @@ export class HonorsService {
     @InjectModel(UserHonor.name)
     private readonly userHonorModel: Model<UserHonorDocument>,
     private readonly media: MediaService,
+    private readonly metrics: HonorMetricsService,
   ) {}
 
   // ============== Asset uploads ==============
@@ -148,6 +151,8 @@ export class HonorsService {
     const tiers = (input.tiers ?? []).map((t) => ({
       name: t.name,
       iconUrl: t.iconUrl ?? '',
+      svgaUrl: t.svgaUrl ?? '',
+      metric: t.metric ?? HonorMetric.NONE,
       target: t.target ?? 0,
       rewardText: t.rewardText ?? '',
     }));
@@ -163,6 +168,8 @@ export class HonorsService {
       category: input.category ?? HonorCategory.SPECIAL,
       iconUrl: input.iconUrl ?? '',
       iconPublicId: input.iconPublicId ?? '',
+      svgaUrl: input.svgaUrl ?? '',
+      svgaPublicId: input.svgaPublicId ?? '',
       iconAssetType: input.iconAssetType ?? HonorAssetType.IMAGE,
       maxTier,
       tiers,
@@ -183,6 +190,10 @@ export class HonorsService {
     if (update.iconPublicId !== undefined) {
       item.iconPublicId = update.iconPublicId;
     }
+    if (update.svgaUrl !== undefined) item.svgaUrl = update.svgaUrl;
+    if (update.svgaPublicId !== undefined) {
+      item.svgaPublicId = update.svgaPublicId;
+    }
     if (update.iconAssetType !== undefined) {
       item.iconAssetType = update.iconAssetType;
     }
@@ -190,6 +201,8 @@ export class HonorsService {
       item.tiers = update.tiers.map((t) => ({
         name: t.name,
         iconUrl: t.iconUrl ?? '',
+        svgaUrl: t.svgaUrl ?? '',
+        metric: t.metric ?? HonorMetric.NONE,
         target: t.target ?? 0,
         rewardText: t.rewardText ?? '',
       }));
@@ -305,6 +318,138 @@ export class HonorsService {
         { upsert: true, new: true },
       )
       .exec() as Promise<UserHonorDocument>;
+  }
+
+  // ============== Rule-based auto-grant ==============
+
+  /**
+   * Re-evaluate one user against the rule-based catalog. For each
+   * active honor that has at least one tier with a rule (metric ≠
+   * NONE), pull the user's current value of that metric, walk the
+   * tiers from highest target to lowest, and grant the highest
+   * tier whose `target` the user meets. Idempotent — calling twice
+   * with the same state is a no-op.
+   *
+   * `metric` filter narrows the scan to just honors whose tiers
+   * reference that metric. Used by the event hooks to avoid
+   * re-scanning the entire catalog when only one stat changed.
+   * Pass `undefined` to scan every metric (e.g. for an admin
+   * "re-evaluate" button or a periodic backfill).
+   *
+   * The honor's tiers don't have to share a metric — admins can
+   * mix-and-match (Lv.1 = 100 followers, Lv.2 = 1000 coins
+   * recharged). Each tier is checked against its own rule.
+   */
+  async evaluateUser(
+    userId: string,
+    metric?: HonorMetric,
+  ): Promise<{ granted: number; upgraded: number }> {
+    if (!Types.ObjectId.isValid(userId)) {
+      return { granted: 0, upgraded: 0 };
+    }
+    const userOid = new Types.ObjectId(userId);
+
+    // Pull the active catalog. We could narrow by `tiers.metric`
+    // when a filter is supplied, but the catalog is small (tens of
+    // rows) so a full scan is fine and avoids missing honors that
+    // mix metrics across tiers.
+    const items = await this.itemModel
+      .find({ active: true })
+      .lean()
+      .exec();
+
+    // Cache metric values for this evaluation so we don't re-fetch
+    // the same wallet / user twice for two different honors that
+    // both reference the same metric.
+    const metricCache = new Map<HonorMetric, number>();
+    const valueOf = async (m: HonorMetric): Promise<number> => {
+      if (metricCache.has(m)) return metricCache.get(m)!;
+      const v = await this.metrics.getValue(userId, m);
+      metricCache.set(m, v);
+      return v;
+    };
+
+    let granted = 0;
+    let upgraded = 0;
+
+    for (const item of items) {
+      const tiers = (item.tiers ?? []) as HonorItem['tiers'];
+      if (tiers.length === 0) continue;
+      // Skip when a metric filter is supplied and none of this
+      // item's tiers use that metric — saves a metric lookup.
+      if (
+        metric !== undefined &&
+        !tiers.some((t) => t.metric === metric)
+      ) {
+        continue;
+      }
+      // Determine the highest tier the user qualifies for. Walk
+      // from highest index downward so the first match wins.
+      let qualifyingIdx = -1;
+      let progressForQualifying = 0;
+      for (let i = tiers.length - 1; i >= 0; i--) {
+        const t = tiers[i];
+        if (t.metric === HonorMetric.NONE) continue;
+        if ((t.target ?? 0) <= 0) continue;
+        const value = await valueOf(t.metric);
+        if (value >= t.target) {
+          qualifyingIdx = i;
+          progressForQualifying = value;
+          break;
+        }
+      }
+      if (qualifyingIdx < 0) {
+        // Even though they don't qualify for any tier, refresh the
+        // progress on Lv.1 so the bar moves. Only fires if a row
+        // already exists — we don't create empty rows for honors
+        // the user hasn't reached.
+        const firstRule = tiers.find(
+          (t) => t.metric !== HonorMetric.NONE && (t.target ?? 0) > 0,
+        );
+        if (firstRule) {
+          const value = await valueOf(firstRule.metric);
+          await this.userHonorModel
+            .updateOne(
+              { userId: userOid, honorItemId: item._id },
+              { $set: { progress: value } },
+            )
+            .exec();
+        }
+        continue;
+      }
+
+      const newTier = qualifyingIdx + 1; // 1-indexed
+      const existing = await this.userHonorModel
+        .findOne({ userId: userOid, honorItemId: item._id })
+        .exec();
+      if (!existing) {
+        await this.userHonorModel.create({
+          userId: userOid,
+          honorItemId: item._id,
+          tier: newTier,
+          source: HonorSource.TASK,
+          progress: progressForQualifying,
+          awardedAt: new Date(),
+        });
+        granted += 1;
+      } else if (existing.tier < newTier) {
+        existing.tier = newTier;
+        existing.source = HonorSource.TASK;
+        existing.progress = progressForQualifying;
+        existing.awardedAt = new Date();
+        await existing.save();
+        upgraded += 1;
+      } else {
+        // Tier unchanged but the metric value may have moved —
+        // bump progress so the bar is fresh.
+        if (existing.progress !== progressForQualifying) {
+          existing.progress = progressForQualifying;
+          await existing.save();
+        }
+      }
+    }
+
+    return { granted, upgraded };
   }
 
   /** Convenience for the task system / event hooks. Same flow as
@@ -430,18 +575,30 @@ export class HonorsService {
           tiers?: HonorItem['tiers'];
         };
         if (!item || item.active === false) return null;
-        // Resolve the tier-specific icon when the catalog has tier
-        // metadata; falls back to the top-level icon for legacy rows.
+        // Resolve the tier-specific icon + svga when the catalog has
+        // tier metadata; falls back to the top-level pair for rows
+        // without tiers.
         const tierIdx = Math.max(0, Math.min((r.tier ?? 1) - 1, (item.tiers?.length ?? 1) - 1));
-        const tierIcon = item.tiers?.[tierIdx]?.iconUrl?.trim();
+        const tier = item.tiers?.[tierIdx];
+        const tierIcon = tier?.iconUrl?.trim();
+        const tierSvga = tier?.svgaUrl?.trim();
+        // Legacy rows shipped one URL on `iconUrl` with
+        // `iconAssetType: 'svga'`. Re-route to `svgaUrl` so clients
+        // always see "iconUrl = static image, svgaUrl = animation".
+        const normalized = this._normalizeAssets({
+          iconUrl: (tierIcon && tierIcon.length > 0) ? tierIcon : item.iconUrl,
+          svgaUrl: (tierSvga && tierSvga.length > 0) ? tierSvga : (item.svgaUrl ?? ''),
+          iconAssetType: item.iconAssetType ?? HonorAssetType.IMAGE,
+        });
         return {
           id: r._id.toString(),
           honorItemId: item._id.toString(),
           key: item.key,
           name: item.name,
           category: item.category,
-          iconUrl: (tierIcon && tierIcon.length > 0) ? tierIcon : item.iconUrl,
-          iconAssetType: item.iconAssetType ?? HonorAssetType.IMAGE,
+          iconUrl: normalized.iconUrl,
+          svgaUrl: normalized.svgaUrl,
+          iconAssetType: normalized.iconAssetType,
           tier: r.tier,
           maxTier: item.maxTier,
           wornSlot: r.wornSlot,
@@ -476,6 +633,11 @@ export class HonorsService {
     const items = all.map((item) => {
       const o = ownedByItem.get(item._id.toString());
       const tiers = (item.tiers ?? []) as HonorItem['tiers'];
+      const normalized = this._normalizeAssets({
+        iconUrl: item.iconUrl ?? '',
+        svgaUrl: item.svgaUrl ?? '',
+        iconAssetType: item.iconAssetType ?? HonorAssetType.IMAGE,
+      });
       return {
         // Catalog fields
         honorItemId: item._id.toString(),
@@ -483,12 +645,15 @@ export class HonorsService {
         name: item.name,
         description: item.description ?? '',
         category: item.category,
-        iconUrl: item.iconUrl ?? '',
-        iconAssetType: item.iconAssetType ?? HonorAssetType.IMAGE,
+        iconUrl: normalized.iconUrl,
+        svgaUrl: normalized.svgaUrl,
+        iconAssetType: normalized.iconAssetType,
         maxTier: item.maxTier,
         tiers: tiers.map((t) => ({
           name: t.name,
           iconUrl: t.iconUrl ?? '',
+          svgaUrl: t.svgaUrl ?? '',
+          metric: t.metric ?? HonorMetric.NONE,
           target: t.target ?? 0,
           rewardText: t.rewardText ?? '',
         })),
@@ -502,6 +667,32 @@ export class HonorsService {
       };
     });
     return { items };
+  }
+
+  /**
+   * Legacy shim: pre–dual-asset rows stored a single URL on
+   * `iconUrl` with `iconAssetType: 'svga'` to mark it as animated.
+   * Normalize on read so clients see the canonical pair —
+   * iconUrl = static image, svgaUrl = animation. Idempotent: rows
+   * that already follow the new pattern pass through unchanged.
+   */
+  private _normalizeAssets(input: {
+    iconUrl: string;
+    svgaUrl: string;
+    iconAssetType: HonorAssetType;
+  }): { iconUrl: string; svgaUrl: string; iconAssetType: HonorAssetType } {
+    if (
+      input.iconAssetType === HonorAssetType.SVGA &&
+      input.svgaUrl.length === 0 &&
+      input.iconUrl.length > 0
+    ) {
+      return {
+        iconUrl: '',
+        svgaUrl: input.iconUrl,
+        iconAssetType: HonorAssetType.IMAGE,
+      };
+    }
+    return input;
   }
 
   async revokeFromUser(

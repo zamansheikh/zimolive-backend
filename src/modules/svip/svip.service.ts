@@ -11,6 +11,8 @@ import { Model, Types } from 'mongoose';
 
 import { CosmeticsService } from '../cosmetics/cosmetics.service';
 import { CosmeticSource } from '../cosmetics/schemas/user-cosmetic.schema';
+import { HonorsService } from '../honors/honors.service';
+import { HonorMetric } from '../honors/schemas/honor-item.schema';
 import { Currency, TxnType } from '../wallet/schemas/transaction.schema';
 import { WalletService } from '../wallet/wallet.service';
 import { SVIP_PRIVILEGES, PrivilegeDef } from './privileges.catalog';
@@ -25,6 +27,7 @@ export class SvipService {
     private readonly statusModel: Model<UserSvipStatusDocument>,
     private readonly wallet: WalletService,
     private readonly cosmetics: CosmeticsService,
+    private readonly honors: HonorsService,
   ) {}
 
   // ---------- Privileges catalog ----------
@@ -267,6 +270,11 @@ export class SvipService {
     if (wasBumped) {
       await this.cosmetics.equipSvipTier(userId, status.currentLevel);
     }
+    // Honor evaluation — SVIP tier change can unlock medals tied
+    // to the SVIP_TIER metric.
+    void this.honors
+      .evaluateUser(userId, HonorMetric.SVIP_TIER)
+      .catch(() => {/* swallow */});
     return status;
   }
 
@@ -315,6 +323,9 @@ export class SvipService {
       null, // duration unknown at this point — extend doesn't shrink, so null is safe
     );
     await this.cosmetics.equipSvipTier(userId, level);
+    void this.honors
+      .evaluateUser(userId, HonorMetric.SVIP_TIER)
+      .catch(() => {/* swallow */});
     return status;
   }
 

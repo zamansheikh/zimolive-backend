@@ -7,6 +7,8 @@ import {
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 
+import { HonorsService } from '../honors/honors.service';
+import { HonorMetric } from '../honors/schemas/honor-item.schema';
 import { User, UserDocument } from '../users/schemas/user.schema';
 import { Follow, FollowDocument } from './schemas/follow.schema';
 import {
@@ -54,6 +56,7 @@ export class SocialService {
     @InjectModel(Follow.name) private readonly followModel: Model<FollowDocument>,
     @InjectModel(ProfileVisit.name)
     private readonly visitModel: Model<ProfileVisitDocument>,
+    private readonly honors: HonorsService,
   ) {}
 
   // ============== Follow / Unfollow ==============
@@ -107,6 +110,15 @@ export class SocialService {
         .updateOne({ _id: followeeOid }, { $inc: { followersCount: 1 } })
         .exec(),
     ]);
+    // Honor evaluation hooks — fire-and-forget. The follower's
+    // FOLLOWING count just bumped; the followee's FOLLOWERS count
+    // just bumped. Either may unlock a rule-based medal.
+    void this.honors
+      .evaluateUser(followerId, HonorMetric.FOLLOWING)
+      .catch(() => {/* swallow */});
+    void this.honors
+      .evaluateUser(followeeId, HonorMetric.FOLLOWERS)
+      .catch(() => {/* swallow */});
     return { created: true };
   }
 

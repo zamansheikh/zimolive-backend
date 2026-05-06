@@ -18,6 +18,7 @@ import {
 import {
   HonorAssetType,
   HonorCategory,
+  HonorMetric,
 } from '../schemas/honor-item.schema';
 
 /** Per-tier definition payload — see HonorItem.tiers in the schema. */
@@ -30,6 +31,14 @@ export class HonorTierDto {
   @IsOptional()
   @IsString()
   iconUrl?: string;
+
+  @IsOptional()
+  @IsString()
+  svgaUrl?: string;
+
+  @IsOptional()
+  @IsEnum(HonorMetric)
+  metric?: HonorMetric;
 
   @IsOptional()
   @IsNumber()
@@ -72,6 +81,14 @@ export class CreateHonorItemDto {
   @IsOptional()
   @IsString()
   iconPublicId?: string;
+
+  @IsOptional()
+  @IsString()
+  svgaUrl?: string;
+
+  @IsOptional()
+  @IsString()
+  svgaPublicId?: string;
 
   @IsOptional()
   @IsEnum(HonorAssetType)
@@ -121,6 +138,14 @@ export class UpdateHonorItemDto {
   @IsOptional()
   @IsString()
   iconPublicId?: string;
+
+  @IsOptional()
+  @IsString()
+  svgaUrl?: string;
+
+  @IsOptional()
+  @IsString()
+  svgaPublicId?: string;
 
   @IsOptional()
   @IsEnum(HonorAssetType)

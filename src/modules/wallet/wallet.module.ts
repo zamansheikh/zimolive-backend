@@ -1,6 +1,7 @@
-import { Module } from '@nestjs/common';
+import { forwardRef, Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 
+import { HonorsModule } from '../honors/honors.module';
 import { AdminWalletOptionsController } from './admin-wallet-options.controller';
 import { AdminWalletController } from './admin-wallet.controller';
 import { ExchangeOption, ExchangeOptionSchema } from './schemas/exchange-option.schema';
@@ -19,6 +20,12 @@ import { WalletService } from './wallet.service';
       { name: RechargePackage.name, schema: RechargePackageSchema },
       { name: ExchangeOption.name, schema: ExchangeOptionSchema },
     ]),
+    // Wallet posts honor-evaluation hooks after recharge / gift
+    // transfers. forwardRef keeps Nest's DI graph happy if any
+    // future module adds a back-reference; today there's no
+    // module-level cycle (HonorsModule registers the wallet
+    // schema directly, not via WalletModule).
+    forwardRef(() => HonorsModule),
   ],
   controllers: [
     WalletController,

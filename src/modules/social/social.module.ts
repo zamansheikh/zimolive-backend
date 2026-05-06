@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 
+import { HonorsModule } from '../honors/honors.module';
 import { User, UserSchema } from '../users/schemas/user.schema';
 import { Follow, FollowSchema } from './schemas/follow.schema';
 import {
@@ -26,6 +27,9 @@ import { SocialService } from './social.service';
       { name: ProfileVisit.name, schema: ProfileVisitSchema },
       { name: User.name, schema: UserSchema },
     ]),
+    // Follow / unfollow fires honor evaluations for the FOLLOWERS
+    // and FOLLOWING metrics so reach-N-friends medals auto-unlock.
+    HonorsModule,
   ],
   controllers: [SocialController],
   providers: [SocialService],

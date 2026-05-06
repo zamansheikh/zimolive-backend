@@ -1,6 +1,8 @@
 import {
   BadRequestException,
   ForbiddenException,
+  forwardRef,
+  Inject,
   Injectable,
   Logger,
   NotFoundException,
@@ -9,6 +11,8 @@ import { InjectConnection, InjectModel } from '@nestjs/mongoose';
 import { Connection, FilterQuery, Model, Types } from 'mongoose';
 import { nanoid } from 'nanoid';
 
+import { HonorsService } from '../honors/honors.service';
+import { HonorMetric } from '../honors/schemas/honor-item.schema';
 import { Wallet, WalletDocument } from './schemas/wallet.schema';
 import {
   Currency,
@@ -61,6 +65,13 @@ export class WalletService {
     @InjectModel(Wallet.name) private readonly walletModel: Model<WalletDocument>,
     @InjectModel(Transaction.name) private readonly txnModel: Model<TransactionDocument>,
     @InjectConnection() private readonly connection: Connection,
+    // forwardRef so the runtime-only edge (wallet → honors → wallet
+    // schema) doesn't get tripped by the module-init order checker.
+    // The schema is registered directly on HonorsModule's
+    // forFeature, so no actual import cycle exists at module level
+    // — this is just to keep Nest's DI graph happy.
+    @Inject(forwardRef(() => HonorsService))
+    private readonly honors: HonorsService,
   ) {}
 
   // ----------- Wallet lookup / lazy create -----------
@@ -195,6 +206,21 @@ export class WalletService {
         performedByIp: p.performedByIp ?? '',
         status: TxnStatus.COMPLETED,
       });
+      // Honor evaluation hook — fire-and-forget so the wallet
+      // write isn't gated on the evaluator. Maps the txn type to
+      // the matching honor metric (recharge → COINS_RECHARGED,
+      // gift send → COINS_SENT, gift receive → DIAMONDS_RECEIVED).
+      // Failures are logged but don't propagate.
+      const metric = this._honorMetricFor(currency, direction, p.type);
+      if (metric) {
+        void this.honors
+          .evaluateUser(p.userId, metric)
+          .catch((e) =>
+            this.logger.warn(
+              `Honor evaluate failed for ${p.userId}/${metric}: ${(e as Error).message}`,
+            ),
+          );
+      }
       return txn;
     } catch (err: any) {
       // Duplicate key (concurrent request slipped through). Reverse the wallet update and return existing.
@@ -564,6 +590,37 @@ export class WalletService {
     }
     if (currency === Currency.DIAMONDS && direction === TxnDirection.DEBIT) {
       if (type === TxnType.WITHDRAWAL) return 'lifetimeDiamondsWithdrawn';
+    }
+    return null;
+  }
+
+  /**
+   * Map a (currency, direction, txn type) tuple to the honor
+   * metric that should be re-evaluated after this transaction.
+   * Mirrors `lifetimeFieldFor` — we re-evaluate exactly the
+   * metrics whose lifetime counter just moved. Returns null when
+   * the txn doesn't affect any rule-based honor.
+   */
+  private _honorMetricFor(
+    currency: Currency,
+    direction: TxnDirection,
+    type: TxnType,
+  ): HonorMetric | null {
+    if (currency === Currency.COINS && direction === TxnDirection.CREDIT) {
+      if (
+        type === TxnType.RECHARGE ||
+        type === TxnType.RECHARGE_BONUS ||
+        type === TxnType.MINT ||
+        type === TxnType.RESELLER_TOPUP
+      ) {
+        return HonorMetric.COINS_RECHARGED;
+      }
+    }
+    if (currency === Currency.COINS && direction === TxnDirection.DEBIT) {
+      if (type === TxnType.GIFT_SEND) return HonorMetric.COINS_SENT;
+    }
+    if (currency === Currency.DIAMONDS && direction === TxnDirection.CREDIT) {
+      if (type === TxnType.GIFT_RECEIVE) return HonorMetric.DIAMONDS_RECEIVED;
     }
     return null;
   }

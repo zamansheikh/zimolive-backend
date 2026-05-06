@@ -41,6 +41,36 @@ export enum HonorAssetType {
 }
 
 /**
+ * Metric that determines whether a user has unlocked a given tier.
+ * Each tier carries `(metric, target)`; the evaluator grants the
+ * highest tier whose `target` the user's current metric value
+ * meets. `none` skips the auto-grant pathway entirely — admins
+ * still grant manually for those.
+ */
+export enum HonorMetric {
+  /// No auto-rule. Admin grants manually only.
+  NONE = 'none',
+  /// Account level (User.level).
+  LEVEL = 'level',
+  /// Lifetime XP earned (User.xp).
+  XP = 'xp',
+  /// Followers count (User.followersCount).
+  FOLLOWERS = 'followers',
+  /// People the user follows (User.followingCount).
+  FOLLOWING = 'following',
+  /// Lifetime coins purchased / minted into the wallet
+  /// (Wallet.lifetimeCoinsRecharged).
+  COINS_RECHARGED = 'coins_recharged',
+  /// Lifetime coins spent on gifts (Wallet.lifetimeCoinsSpent).
+  COINS_SENT = 'coins_sent',
+  /// Lifetime diamonds earned from received gifts
+  /// (Wallet.lifetimeDiamondsEarned).
+  DIAMONDS_RECEIVED = 'diamonds_received',
+  /// SVIP currentLevel from UserSvipStatus.
+  SVIP_TIER = 'svip_tier',
+}
+
+/**
  * Catalog row for one honor / achievement badge.
  *
  * Honors are tiered (1..maxTier stars). The icon stays the same;
@@ -76,16 +106,28 @@ export class HonorItem {
   @Prop({ type: String, enum: HonorCategory, default: HonorCategory.SPECIAL, index: true })
   category!: HonorCategory;
 
-  /** Cloudinary URL for the icon. Static image or SVGA file
-   *  depending on `iconAssetType`. */
+  /** Cloudinary URL for the static-image icon. Always an image
+   *  going forward — used for the Honor Wall grid tile and any
+   *  surface where an animation would be wasteful. */
   @Prop({ type: String, default: '' })
   iconUrl!: string;
 
   @Prop({ type: String, default: '' })
   iconPublicId!: string;
 
-  /** Whether `iconUrl` points to a static image or an SVGA animation.
-   *  Defaults to IMAGE so existing rows render without a migration. */
+  /** Optional SVGA animation URL — rendered on the medal detail
+   *  sheet (and other "hero" surfaces) when set. Empty string falls
+   *  back to `iconUrl`. Coexists with `iconUrl` so admins can ship
+   *  a static thumbnail + an animated showcase from the same row. */
+  @Prop({ type: String, default: '' })
+  svgaUrl!: string;
+
+  @Prop({ type: String, default: '' })
+  svgaPublicId!: string;
+
+  /** Legacy field — kept for backwards compatibility. New rows set
+   *  this to `image`; old `svga` rows are normalized in the service
+   *  read path so the URL flows out as `svgaUrl` to the client. */
   @Prop({
     type: String,
     enum: HonorAssetType,
@@ -116,6 +158,12 @@ export class HonorItem {
       {
         name: { type: String, required: true, maxlength: 40 },
         iconUrl: { type: String, default: '' },
+        svgaUrl: { type: String, default: '' },
+        metric: {
+          type: String,
+          enum: HonorMetric,
+          default: HonorMetric.NONE,
+        },
         target: { type: Number, default: 0, min: 0 },
         rewardText: { type: String, default: '', maxlength: 200 },
         _id: false,
@@ -126,6 +174,8 @@ export class HonorItem {
   tiers!: Array<{
     name: string;
     iconUrl: string;
+    svgaUrl: string;
+    metric: HonorMetric;
     target: number;
     rewardText: string;
   }>;
