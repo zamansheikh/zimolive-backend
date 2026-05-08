@@ -34,6 +34,23 @@ ok()   { c_green "  ✓ $*"; }
 
 # --- 1. Apt + base tools ---------------------------------------------------
 
+# Detect distro (debian vs ubuntu) so we point at the right Docker repo.
+# /etc/os-release exposes ID=debian|ubuntu and VERSION_CODENAME=bookworm|noble|...
+. /etc/os-release
+DISTRO_ID="${ID:-debian}"
+DISTRO_CODENAME="${VERSION_CODENAME:-}"
+case "$DISTRO_ID" in
+  debian|ubuntu) ;;
+  *)
+    echo "Unsupported distro: $DISTRO_ID (only debian/ubuntu are handled)" >&2
+    exit 1
+    ;;
+esac
+
+# A previous failed run may have left a docker.list pointing at the wrong distro,
+# which would make even `apt-get update` below fail. Wipe it before refreshing.
+rm -f /etc/apt/sources.list.d/docker.list
+
 step "Installing base packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -45,14 +62,14 @@ ok "Base packages installed"
 if command -v docker >/dev/null 2>&1; then
   ok "Docker already installed ($(docker --version))"
 else
-  step "Installing Docker Engine + Compose plugin"
+  step "Installing Docker Engine + Compose plugin ($DISTRO_ID $DISTRO_CODENAME)"
   install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/debian/gpg \
+  curl -fsSL "https://download.docker.com/linux/$DISTRO_ID/gpg" \
     | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
   chmod a+r /etc/apt/keyrings/docker.gpg
   echo \
     "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-     https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+     https://download.docker.com/linux/$DISTRO_ID $DISTRO_CODENAME stable" \
     > /etc/apt/sources.list.d/docker.list
   apt-get update -qq
   apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
