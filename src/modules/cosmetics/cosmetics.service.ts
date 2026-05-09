@@ -85,6 +85,27 @@ export class CosmeticsService {
     return this.itemModel.findById(id).exec();
   }
 
+  /**
+   * Bulk-fetch active cosmetic items by id. Filters out invalid ids
+   * client-side so a single bad id in a batch doesn't reject the
+   * whole request. Used by the mobile SVIP page to render thumbnails
+   * for tier-granted items that aren't sold via the store (and so
+   * don't surface in `/store/listings`).
+   *
+   * Cap at 100 ids per call — way more than any legitimate caller
+   * needs, and keeps the index scan bounded.
+   */
+  async findActiveByIds(ids: string[]): Promise<CosmeticItemDocument[]> {
+    const valid = ids
+      .filter((id) => typeof id === 'string' && Types.ObjectId.isValid(id))
+      .slice(0, 100)
+      .map((id) => new Types.ObjectId(id));
+    if (valid.length === 0) return [];
+    return this.itemModel
+      .find({ _id: { $in: valid }, active: true })
+      .exec();
+  }
+
   async getByIdOrThrow(id: string): Promise<CosmeticItemDocument> {
     const it = await this.findById(id);
     if (!it) throw new NotFoundException('Cosmetic item not found');

@@ -24,6 +24,40 @@ import { CosmeticsService } from './cosmetics.service';
 export class PublicCosmeticsController {
   constructor(private readonly cosmetics: CosmeticsService) {}
 
+  /**
+   * Batch-fetch the public catalog projection for a comma-separated
+   * list of cosmetic ids. Returns whatever subset is found + still
+   * active — clients are expected to merge against their own keys
+   * and tolerate missing entries (the catalog row may have been
+   * retired between when the ID list was built and when the lookup
+   * fires).
+   *
+   * Powers the SVIP page's tier-granted-item preview: tiers can grant
+   * cosmetics that aren't sold via the store, and so don't surface in
+   * `/store/listings`. This endpoint fills that gap with one round-trip.
+   */
+  @Public()
+  @Get()
+  async listByIds(@Query('ids') ids?: string) {
+    const list = (ids ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    if (list.length === 0) return { items: [] };
+    const docs = await this.cosmetics.findActiveByIds(list);
+    const items = docs.map((d) => ({
+      id: d._id.toString(),
+      code: d.code,
+      name: d.name,
+      type: d.type,
+      previewUrl: d.previewUrl ?? '',
+      assetType: d.assetType ?? 'image',
+      assetUrl: d.assetUrl ?? '',
+      rarity: d.rarity ?? 1,
+    }));
+    return { items };
+  }
+
   @Public()
   @Get('users/:userId')
   async forUser(@Param('userId') userId: string) {
