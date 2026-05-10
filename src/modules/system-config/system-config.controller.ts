@@ -15,6 +15,14 @@ class UpdateAppConfigDto {
   @IsOptional()
   @IsBoolean()
   agenciesEnabled?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  emailLoginEnabled?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  phoneLoginEnabled?: boolean;
 }
 
 /**
@@ -34,6 +42,8 @@ export class SystemConfigController {
     return {
       familiesEnabled: cfg.familiesEnabled,
       agenciesEnabled: cfg.agenciesEnabled,
+      emailLoginEnabled: cfg.emailLoginEnabled,
+      phoneLoginEnabled: cfg.phoneLoginEnabled,
     };
   }
 

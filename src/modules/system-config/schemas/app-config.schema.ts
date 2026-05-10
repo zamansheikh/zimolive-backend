@@ -44,6 +44,29 @@ export class AppConfig {
    */
   @Prop({ type: Boolean, default: true })
   agenciesEnabled!: boolean;
+
+  /**
+   * Whether email + password login is exposed in the mobile app. The
+   * BACKEND endpoints (`/auth/register/email`, `/auth/login/email`)
+   * remain available regardless — this flag only controls UI exposure
+   * so we can stage rollouts without dropping in-flight sessions.
+   *
+   * Default false: launch with Google / Apple Sign-In only, enable
+   * email later if needed.
+   */
+  @Prop({ type: Boolean, default: false })
+  emailLoginEnabled!: boolean;
+
+  /**
+   * Whether phone-OTP login is exposed in the mobile app. Same shape
+   * as `emailLoginEnabled` — backend `/auth/otp/send` + `/auth/otp/verify`
+   * stay available; this only hides the UI when off.
+   *
+   * Default false: lots of regions where SMS deliverability is
+   * unreliable and we don't want to ship a broken-looking flow.
+   */
+  @Prop({ type: Boolean, default: false })
+  phoneLoginEnabled!: boolean;
 }
 
 export const AppConfigSchema = SchemaFactory.createForClass(AppConfig);
