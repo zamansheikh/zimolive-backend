@@ -20,6 +20,7 @@ import { CosmeticsService } from '../cosmetics/cosmetics.service';
 import { FcmService } from '../fcm/fcm.service';
 import { GiftsService } from '../gifts/gifts.service';
 import { MagicBallService } from '../magic-ball/magic-ball.service';
+import { ContentFilterService } from '../moderation/content-filter.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { RealtimeEventType } from '../realtime/realtime.types';
 import { User, UserDocument } from '../users/schemas/user.schema';
@@ -77,6 +78,12 @@ export class RoomsService implements OnModuleInit {
     private readonly cosmetics: CosmeticsService,
     private readonly magicBall: MagicBallService,
     private readonly fcm: FcmService,
+    // Content filter for room chat. Provided by ModerationModule
+    // (which is @Global, so no module-level import needed). Catches
+    // CSAE / self-harm / solicitation patterns before the message
+    // hits the database — required for Google Play submission of
+    // a live-streaming social app.
+    private readonly contentFilter: ContentFilterService,
   ) {}
 
   /**
@@ -1528,10 +1535,27 @@ export class RoomsService implements OnModuleInit {
       });
     }
 
+    // Content filter — runs after auth/policy checks so we don't
+    // burn regex on traffic that would be rejected anyway. Hard
+    // categories (CSAE, self-harm, solicitation) reject the message;
+    // soft hits (doxxing patterns) get masked with **** and saved
+    // through. The error code intentionally doesn't reveal which
+    // category fired — that info goes to the admin moderation log,
+    // not back to the abuser.
+    const filtered = this.contentFilter.check(trimmed);
+    if (filtered.blocked) {
+      throw new BadRequestException({
+        code: 'MESSAGE_REJECTED',
+        message:
+          'Your message was blocked by our community guidelines. Please rephrase.',
+      });
+    }
+    const finalText = filtered.text;
+
     const created = await this.chatModel.create({
       roomId: room._id,
       authorId: userOid,
-      text: trimmed,
+      text: finalText,
       status: RoomChatStatus.ACTIVE,
     });
     const populated = await this.chatModel

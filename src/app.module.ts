@@ -28,6 +28,7 @@ import { MessagesModule } from './modules/messages/messages.module';
 import { MomentsModule } from './modules/moments/moments.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
 import { RealtimeModule } from './modules/realtime/realtime.module';
+import { ModerationModule } from './modules/moderation/moderation.module';
 import { ReportsModule } from './modules/reports/reports.module';
 import { ResellersModule } from './modules/resellers/resellers.module';
 import { RevenueCatModule } from './modules/revenuecat/revenuecat.module';
@@ -132,6 +133,10 @@ import { WalletModule } from './modules/wallet/wallet.module';
     SearchModule,
     ReportsModule,
     RevenueCatModule,
+    // Global; exports ContentFilterService so any UGC ingest path
+    // (room chat today; DMs / moments comments next) can inject it
+    // without an explicit module-level dependency.
+    ModerationModule,
   ],
   controllers: [AppController],
   providers: [
