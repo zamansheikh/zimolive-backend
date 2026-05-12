@@ -2161,6 +2161,14 @@ export class RoomsService implements OnModuleInit {
         { $set: { role: RoomRole.ADMIN } },
       )
       .exec();
+    // Broadcast the updated room so every client patches its admin
+    // list live — without this the target user (and everyone else)
+    // would only learn about the promotion on next room enter.
+    void this.realtime.emitToRoom(
+      room._id.toString(),
+      RealtimeEventType.ROOM_SETTINGS_UPDATED,
+      { room: room.toJSON() },
+    );
     return { ok: true };
   }
 
@@ -2176,6 +2184,12 @@ export class RoomsService implements OnModuleInit {
         { $set: { role: RoomRole.MEMBER } },
       )
       .exec();
+    // Broadcast the updated room — see `promoteAdmin` for rationale.
+    void this.realtime.emitToRoom(
+      room._id.toString(),
+      RealtimeEventType.ROOM_SETTINGS_UPDATED,
+      { room: room.toJSON() },
+    );
     return { ok: true };
   }
 
