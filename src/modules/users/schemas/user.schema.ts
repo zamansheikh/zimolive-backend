@@ -210,6 +210,25 @@ export class User {
 
   @Prop({ type: Types.ObjectId, ref: 'AdminUser', default: null, index: true })
   linkedAdminId?: Types.ObjectId | null;
+
+  // ------- Agency-management powers (app-side) -------
+  //
+  // Granted by a platform admin from the admin panel. Drives the
+  // "Management Power" section on the user's profile in the mobile
+  // app: when this list is non-empty, the section becomes visible
+  // and the matching tiles route into the agency-management UI.
+  //
+  // Stored as plain strings so admins can grant a subset (e.g. only
+  // `agency.create`) without flipping a binary "is admin?" flag.
+  // Examples:
+  //   • 'agency.create'  — can found a new agency from the mobile app
+  //   • 'agency.manage'  — can manage any agency they own / co-own
+  //
+  // Membership-derived powers (owner / admin role on a specific
+  // agency) are NOT stored here — those live on `AgencyMember.role`
+  // so a user who quits the agency loses them automatically.
+  @Prop({ type: [String], default: [] })
+  agencyPowers!: string[];
 }
 
 export const UserSchema = SchemaFactory.createForClass(User);

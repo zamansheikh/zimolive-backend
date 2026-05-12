@@ -124,6 +124,28 @@ export class AppUsersController {
     return { user: await this.users.findById(user._id.toString()), admin };
   }
 
+  /**
+   * Set the user's agency-management powers. Gated on `agency.manage`
+   * so only platform admins who can already manage agencies can grant
+   * the corresponding app-side power. Accepts a fresh list every time
+   * (not a diff) — the UI sends the desired final state.
+   */
+  @RequirePermissions(PERMISSIONS.AGENCY_MANAGE)
+  @Post(':id/agency-powers')
+  async setAgencyPowers(
+    @Param('id') id: string,
+    @Body() dto: { powers?: string[] },
+  ) {
+    const requested = Array.isArray(dto.powers) ? dto.powers : [];
+    // Whitelist: only powers in the catalog can be granted. Anything
+    // else is dropped silently rather than 400'd so a stale UI doesn't
+    // break the request.
+    const allowed = new Set(['agency.create', 'agency.manage']);
+    const filtered = requested.filter((p) => allowed.has(p));
+    const user = await this.users.setAgencyPowers(id, filtered);
+    return { user };
+  }
+
   @RequirePermissions(PERMISSIONS.ADMIN_UPDATE)
   @Post(':id/unlink-admin')
   async unlinkAdmin(@Param('id') id: string) {

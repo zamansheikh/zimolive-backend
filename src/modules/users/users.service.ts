@@ -292,6 +292,56 @@ export class UsersService {
     return user;
   }
 
+  /**
+   * Join-an-agency host promotion. Idempotent helper used by the agency
+   * flows so the caller doesn't have to special-case "is the user already
+   * a host?":
+   *
+   *   • Already a host  → only the host's `agencyId` is updated; tier /
+   *     stream hours / diamond totals stay put so we don't accidentally
+   *     demote a Diamond host back to Trainee when they switch agencies.
+   *   • Not yet a host  → fresh `setHost(true)` at Trainee tier, with
+   *     the agency baked into the new hostProfile.
+   *
+   * Returns the saved user document. Centralising this here keeps the
+   * "joining an agency makes you a host" rule in one place instead of
+   * leaking it across every entry point.
+   */
+  async ensureHostForAgency(
+    userId: string,
+    agencyId: string,
+    approvedBy?: string,
+  ): Promise<UserDocument> {
+    const user = await this.getByIdOrThrow(userId);
+    if (user.isHost) {
+      const oid = Types.ObjectId.isValid(agencyId)
+        ? new Types.ObjectId(agencyId)
+        : null;
+      // Patch the agency link without touching tier / hours / earnings.
+      if (user.hostProfile) {
+        user.hostProfile.agencyId = oid;
+      } else {
+        user.hostProfile = {
+          tier: HostTier.TRAINEE,
+          approvedAt: new Date(),
+          approvedBy: approvedBy
+            ? new Types.ObjectId(approvedBy)
+            : null,
+          agencyId: oid,
+          totalDiamondsEarned: 0,
+          streamHours: 0,
+        } as any;
+      }
+      await user.save();
+      return user;
+    }
+    return this.setHost(userId, true, {
+      tier: HostTier.TRAINEE,
+      approvedBy,
+      agencyId,
+    });
+  }
+
   async setHost(
     id: string,
     makeHost: boolean,
@@ -332,6 +382,45 @@ export class UsersService {
         { $set: { linkedAdminId: adminId ? new Types.ObjectId(adminId) : null } },
       )
       .exec();
+  }
+
+  /**
+   * Replace the user's `agencyPowers` array. Drives the mobile app's
+   * "Management" section visibility — when this list is non-empty, the
+   * section becomes visible on the user's profile.
+   *
+   * Known powers:
+   *   • `agency.create` — can found a new agency from the mobile app
+   *   • `agency.manage` — moderator override across every agency
+   *
+   * The caller already validated against the permissions catalog; we
+   * just store whatever array was passed. De-duped + filtered to drop
+   * blank strings so a stray UI bug can't smuggle nonsense in.
+   */
+  async setAgencyPowers(userId: string, powers: string[]): Promise<UserDocument> {
+    if (!Types.ObjectId.isValid(userId)) {
+      throw new BadRequestException({
+        code: 'INVALID_USER_ID',
+        message: 'Invalid user id',
+      });
+    }
+    const clean = Array.from(
+      new Set(powers.map((p) => p.trim()).filter((p) => p.length > 0)),
+    );
+    const user = await this.userModel
+      .findByIdAndUpdate(
+        userId,
+        { $set: { agencyPowers: clean } },
+        { new: true },
+      )
+      .exec();
+    if (!user) {
+      throw new NotFoundException({
+        code: 'USER_NOT_FOUND',
+        message: 'User not found',
+      });
+    }
+    return user;
   }
 
   // -------------------- Profile (user-facing) --------------------

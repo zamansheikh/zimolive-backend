@@ -13,6 +13,11 @@ import { NumericIdService } from '../common/numeric-id.service';
 import { CounterScope } from '../common/schemas/counter.schema';
 import { SystemConfigService } from '../system-config/system-config.service';
 import { UsersService } from '../users/users.service';
+import {
+  AgencyMember,
+  AgencyMemberDocument,
+  AgencyMemberRole,
+} from './schemas/agency-member.schema';
 import { Agency, AgencyDocument, AgencyStatus } from './schemas/agency.schema';
 
 interface ListAgenciesParams {
@@ -39,6 +44,8 @@ interface CreateAgencyInput {
 export class AgenciesService {
   constructor(
     @InjectModel(Agency.name) private readonly agencyModel: Model<AgencyDocument>,
+    @InjectModel(AgencyMember.name)
+    private readonly memberModel: Model<AgencyMemberDocument>,
     private readonly users: UsersService,
     private readonly numericIds: NumericIdService,
     private readonly config: SystemConfigService,
@@ -281,5 +288,203 @@ export class AgenciesService {
   async exists(id: string): Promise<boolean> {
     if (!Types.ObjectId.isValid(id)) return false;
     return (await this.agencyModel.countDocuments({ _id: id }).exec()) > 0;
+  }
+
+  // ---------------- App-side agency members (admin panel) ----------------
+  //
+  // App users join an agency by sending a join request from the mobile
+  // app, which is then approved by the agency owner / admin. Platform
+  // admins can also drop a user straight into an agency from here — useful
+  // for onboarding agencies that came in via offline contracts.
+
+  /**
+   * Roster for the admin panel. Hydrates each member with the linked
+   * user's display info so the table can show name + numericId + avatar
+   * without a follow-up call per row.
+   */
+  async listMembers(
+    id: string,
+    params: { page?: number; limit?: number },
+    admin: AuthenticatedAdmin,
+  ) {
+    const agency = await this.findOneOr404(id, admin);
+    const page = Math.max(1, params.page ?? 1);
+    const limit = Math.min(100, Math.max(1, params.limit ?? 50));
+    const skip = (page - 1) * limit;
+    const [rawItems, total] = await Promise.all([
+      this.memberModel
+        .find({ agencyId: agency._id })
+        .sort({ role: 1, joinedAt: 1 })
+        .skip(skip)
+        .limit(limit)
+        .populate(
+          'userId',
+          'username displayName avatarUrl numericId level isHost',
+        )
+        .lean()
+        .exec(),
+      this.memberModel.countDocuments({ agencyId: agency._id }).exec(),
+    ]);
+    // `.lean()` skips the schema-level `_id → id` transform, so the
+    // populated user comes back with `_id` and the admin panel's table
+    // (which reads `user.id`) sends `undefined` back into our delete /
+    // role-change endpoints. Normalize here so every consumer sees the
+    // same shape regardless of the query mode underneath.
+    const items = rawItems.map((m: any) => {
+      const rawUser = m.userId;
+      const userObj =
+        rawUser && typeof rawUser === 'object'
+          ? {
+              ...rawUser,
+              id: rawUser._id?.toString(),
+              _id: rawUser._id?.toString(),
+            }
+          : rawUser?.toString();
+      return {
+        ...m,
+        id: m._id?.toString(),
+        _id: m._id?.toString(),
+        agencyId: m.agencyId?.toString(),
+        userId: userObj,
+      };
+    });
+    return { items, page, limit, total };
+  }
+
+  /**
+   * Add an app user to the agency with the given role. Upserts so the
+   * same call can both promote an existing member ("flip member → admin")
+   * and seed a new one. Owners are unique per agency — assigning a new
+   * owner demotes the previous one to admin.
+   */
+  async addMember(
+    id: string,
+    userId: string,
+    role: AgencyMemberRole,
+    admin: AuthenticatedAdmin,
+  ): Promise<AgencyMemberDocument> {
+    await this.assertFeatureEnabled();
+    if (!Types.ObjectId.isValid(userId)) {
+      throw new BadRequestException({
+        code: 'INVALID_USER_ID',
+        message: 'Invalid user id',
+      });
+    }
+    const agency = await this.findOneOr404(id, admin);
+    // The user must actually exist — surfaces a clearer 404 than a
+    // foreign-key error from the upsert.
+    await this.users.getByIdOrThrow(userId);
+
+    const userOid = new Types.ObjectId(userId);
+    // Already a member of another agency? Reject — one-agency-at-a-time
+    // is enforced by the unique index on `userId` anyway, but we want a
+    // human-readable error.
+    const conflicting = await this.memberModel
+      .findOne({ userId: userOid })
+      .lean()
+      .exec();
+    if (conflicting && !conflicting.agencyId.equals(agency._id)) {
+      throw new ConflictException({
+        code: 'ALREADY_IN_OTHER_AGENCY',
+        message:
+          'This user is already a member of another agency. Remove them there first.',
+      });
+    }
+
+    // Owner is exclusive. If we're assigning a new owner and one
+    // already exists, demote the incumbent to admin so the invariant
+    // holds.
+    if (role === AgencyMemberRole.OWNER) {
+      await this.memberModel
+        .updateMany(
+          {
+            agencyId: agency._id,
+            role: AgencyMemberRole.OWNER,
+            userId: { $ne: userOid },
+          },
+          { $set: { role: AgencyMemberRole.ADMIN } },
+        )
+        .exec();
+    }
+
+    const isInsert = !conflicting;
+    const member = await this.memberModel
+      .findOneAndUpdate(
+        { agencyId: agency._id, userId: userOid },
+        {
+          $set: { role },
+          $setOnInsert: { joinedAt: new Date() },
+        },
+        { new: true, upsert: true },
+      )
+      .exec();
+    // Counter — only bump on a true insert.
+    if (isInsert) {
+      await this.agencyModel
+        .updateOne({ _id: agency._id }, { $inc: { hostCount: 1 } })
+        .exec();
+    }
+    // Joining an agency auto-promotes to host (Trainee tier) — same
+    // rule the mobile join-approve path enforces, applied here so an
+    // admin-side `Add member` doesn't bypass it. No-op when the user
+    // is already a host (only patches `hostProfile.agencyId`).
+    await this.users.ensureHostForAgency(
+      userOid.toString(),
+      agency._id.toString(),
+      admin.adminId,
+    );
+    return member;
+  }
+
+  /**
+   * Remove an app user from the agency. Refuses to remove the lone
+   * owner — admin must transfer ownership first (i.e., promote someone
+   * else to owner, which demotes the incumbent automatically).
+   */
+  async removeMember(
+    id: string,
+    userId: string,
+    admin: AuthenticatedAdmin,
+  ): Promise<{ ok: true }> {
+    if (!Types.ObjectId.isValid(userId)) {
+      throw new BadRequestException({
+        code: 'INVALID_USER_ID',
+        message: 'Invalid user id',
+      });
+    }
+    const agency = await this.findOneOr404(id, admin);
+    const target = await this.memberModel
+      .findOne({ agencyId: agency._id, userId: new Types.ObjectId(userId) })
+      .exec();
+    if (!target) {
+      throw new NotFoundException({
+        code: 'MEMBER_NOT_FOUND',
+        message: 'This user is not a member of the agency',
+      });
+    }
+    if (target.role === AgencyMemberRole.OWNER) {
+      const otherOwners = await this.memberModel
+        .countDocuments({
+          agencyId: agency._id,
+          role: AgencyMemberRole.OWNER,
+          _id: { $ne: target._id },
+        })
+        .exec();
+      if (otherOwners === 0) {
+        throw new BadRequestException({
+          code: 'CANNOT_REMOVE_LONE_OWNER',
+          message:
+            'Transfer ownership to another member before removing this user',
+        });
+      }
+    }
+    await this.memberModel.deleteOne({ _id: target._id }).exec();
+    await this.agencyModel
+      .updateOne(
+        { _id: agency._id, hostCount: { $gt: 0 } },
+        { $inc: { hostCount: -1 } },
+      )
+      .exec();
+    return { ok: true };
   }
 }

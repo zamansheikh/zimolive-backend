@@ -1,4 +1,14 @@
-import { Body, Controller, Get, Param, Patch, Post, Query } from '@nestjs/common';
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Param,
+  Patch,
+  Post,
+  Query,
+} from '@nestjs/common';
 
 import { AdminOnly } from '../admin/admin-auth/decorators/admin-only.decorator';
 import { CurrentAdmin } from '../admin/admin-auth/decorators/current-admin.decorator';
@@ -11,6 +21,7 @@ import {
   UpdateAgencyDto,
   UpdateAgencyStatusDto,
 } from './dto/agency.dto';
+import { AgencyMemberRole } from './schemas/agency-member.schema';
 import { AgencyStatus } from './schemas/agency.schema';
 
 @Controller({ path: 'admin/agencies', version: '1' })
@@ -101,5 +112,64 @@ export class AgenciesController {
   ) {
     const agency = await this.agencies.unassignHost(id, userId, admin);
     return { agency };
+  }
+
+  // ----- App-side members (owner / admin / member roles) -----
+
+  @RequirePermissions(PERMISSIONS.AGENCY_VIEW)
+  @Get(':id/members')
+  async listMembers(
+    @Param('id') id: string,
+    @CurrentAdmin() admin: AuthenticatedAdmin,
+    @Query('page') page?: number,
+    @Query('limit') limit?: number,
+  ) {
+    return this.agencies.listMembers(id, { page, limit }, admin);
+  }
+
+  /**
+   * Add an app user to the agency. Body: `{ userId, role }` where
+   * `role` is `owner`/`admin`/`member`. Upserts — calling again with a
+   * different role flips the role.
+   */
+  @RequirePermissions(PERMISSIONS.AGENCY_MANAGE)
+  @Post(':id/members')
+  async addMember(
+    @Param('id') id: string,
+    @Body() body: { userId?: string; role?: string },
+    @CurrentAdmin() admin: AuthenticatedAdmin,
+  ) {
+    const userId = body.userId;
+    const roleStr = (body.role ?? AgencyMemberRole.MEMBER).toLowerCase();
+    if (!userId) {
+      throw new BadRequestException({
+        code: 'MISSING_USER_ID',
+        message: 'userId is required',
+      });
+    }
+    const validRoles = Object.values(AgencyMemberRole) as string[];
+    if (!validRoles.includes(roleStr)) {
+      throw new BadRequestException({
+        code: 'INVALID_ROLE',
+        message: `role must be one of ${validRoles.join(', ')}`,
+      });
+    }
+    const member = await this.agencies.addMember(
+      id,
+      userId,
+      roleStr as AgencyMemberRole,
+      admin,
+    );
+    return { member };
+  }
+
+  @RequirePermissions(PERMISSIONS.AGENCY_MANAGE)
+  @Delete(':id/members/:userId')
+  async removeMember(
+    @Param('id') id: string,
+    @Param('userId') userId: string,
+    @CurrentAdmin() admin: AuthenticatedAdmin,
+  ) {
+    return this.agencies.removeMember(id, userId, admin);
   }
 }
