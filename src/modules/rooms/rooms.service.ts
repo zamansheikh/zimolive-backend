@@ -403,6 +403,7 @@ export class RoomsService implements OnModuleInit {
             userId: null,
             joinedAt: null,
             muted: false,
+            mutedBy: null,
             locked: false,
             videoEnabled: false,
           },
@@ -1029,7 +1030,7 @@ export class RoomsService implements OnModuleInit {
       await this.seatModel
         .updateMany(
           { roomId: room._id, userId: userOid },
-          { $set: { userId: null, joinedAt: null, muted: false, videoEnabled: false } },
+          { $set: { userId: null, joinedAt: null, muted: false, mutedBy: null, videoEnabled: false } },
         )
         .exec();
       // Emit a SEAT_UPDATED for each freed seat so the grid empties live.
@@ -1265,7 +1266,7 @@ export class RoomsService implements OnModuleInit {
     await this.seatModel
       .updateMany(
         { roomId: room._id, userId: { $ne: null } },
-        { $set: { userId: null, joinedAt: null, muted: false, videoEnabled: false } },
+        { $set: { userId: null, joinedAt: null, muted: false, mutedBy: null, videoEnabled: false } },
       )
       .exec();
     void this.realtime.emitToRoom(
@@ -1406,6 +1407,7 @@ export class RoomsService implements OnModuleInit {
             userId: userOid,
             joinedAt: new Date(),
             muted: false,
+            mutedBy: null,
             videoEnabled: defaultVideoOn,
           },
         },
@@ -1449,6 +1451,7 @@ export class RoomsService implements OnModuleInit {
               userId: null,
               joinedAt: null,
               muted: false,
+              mutedBy: null,
               videoEnabled: false,
             },
           },
@@ -1502,7 +1505,7 @@ export class RoomsService implements OnModuleInit {
     const res = await this.seatModel
       .findOneAndUpdate(
         { roomId: room._id, seatIndex, userId: userOid },
-        { $set: { userId: null, joinedAt: null, muted: false, videoEnabled: false } },
+        { $set: { userId: null, joinedAt: null, muted: false, mutedBy: null, videoEnabled: false } },
         { new: true },
       )
       .exec();
@@ -1616,7 +1619,46 @@ export class RoomsService implements OnModuleInit {
       });
     }
 
-    if (seat.muted === muted) {
+    // The rule is "did I mute my own seat, or did someone else mute
+    // me". A host muting their OWN seat is still a self-mute — they
+    // get to unmute themselves whenever they want. `host` only
+    // applies when a moderator acts on *someone else's* seat.
+    const isModerator = isOwner || isAdmin;
+
+    // A host force-mute can only be lifted by a host. Without this
+    // guard, a muted seat-holder could just re-call the endpoint as
+    // themselves and the server would happily unmute them. The
+    // seat-holder is exempt when THEY were the muter (mutedBy='self'),
+    // and moderators bypass for everyone (so a mod can unmute the
+    // user they muted).
+    if (
+      !muted &&
+      seat.muted &&
+      seat.mutedBy === 'host' &&
+      !isModerator
+    ) {
+      throw new ForbiddenException({
+        code: 'HOST_MUTED',
+        message: 'You were muted by the host and cannot unmute yourself',
+      });
+    }
+
+    // Decide the next `mutedBy` BEFORE the no-op short-circuit so a
+    // moderator muting someone else's seat upgrades `self` → `host`
+    // (which closes the unmute loophole above) even when `muted` was
+    // already true.
+    //
+    // `isSelf` wins over `isModerator`: a host muting THEIR OWN seat is
+    // a self-mute. Otherwise (a moderator acting on someone else's
+    // seat) it's a host-mute. Plain users acting on their own seat
+    // are obviously `self`.
+    const nextMutedBy: 'self' | 'host' | null = muted
+      ? isSelf
+        ? 'self'
+        : 'host'
+      : null;
+
+    if (seat.muted === muted && seat.mutedBy === nextMutedBy) {
       const hydrated = await this.seatModel
         .findById(seat._id)
         .populate(
@@ -1627,6 +1669,7 @@ export class RoomsService implements OnModuleInit {
       return { seat: (hydrated ?? seat).toJSON() };
     }
     seat.muted = muted;
+    seat.mutedBy = nextMutedBy;
     await seat.save();
     const hydrated = await this.seatModel
       .findById(seat._id)
@@ -1746,7 +1789,7 @@ export class RoomsService implements OnModuleInit {
     const seat = await this.seatModel
       .findOneAndUpdate(
         { roomId: room._id, seatIndex, userId: { $ne: null } },
-        { $set: { userId: null, joinedAt: null, muted: false, videoEnabled: false } },
+        { $set: { userId: null, joinedAt: null, muted: false, mutedBy: null, videoEnabled: false } },
         { new: true },
       )
       .exec();
@@ -2255,7 +2298,7 @@ export class RoomsService implements OnModuleInit {
       this.seatModel
         .updateMany(
           { roomId: room._id, userId: targetOid },
-          { $set: { userId: null, joinedAt: null, muted: false, videoEnabled: false } },
+          { $set: { userId: null, joinedAt: null, muted: false, mutedBy: null, videoEnabled: false } },
         )
         .exec(),
       this.roomModel
@@ -2568,7 +2611,7 @@ export class RoomsService implements OnModuleInit {
       this.seatModel
         .updateMany(
           { roomId: room._id, userId: { $ne: null } },
-          { $set: { userId: null, joinedAt: null, muted: false, videoEnabled: false } },
+          { $set: { userId: null, joinedAt: null, muted: false, mutedBy: null, videoEnabled: false } },
         )
         .exec(),
       this.roomModel

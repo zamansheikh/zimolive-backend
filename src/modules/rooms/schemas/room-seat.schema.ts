@@ -45,9 +45,29 @@ export class RoomSeat {
   @Prop({ type: Boolean, default: false })
   locked!: boolean;
 
-  /** Force-muted by host. The user keeps the seat but can't publish audio. */
+  /**
+   * Effective mute state — covers both self-mute (user tapped their mic
+   * button) and host-mute (owner/admin force-muted the seat). Drives the
+   * mic-off badge that everyone in the room sees over the seat tile.
+   * When `muted=false`, the seat is publishing audio (subject to Agora
+   * permissions etc.).
+   */
   @Prop({ type: Boolean, default: false })
   muted!: boolean;
+
+  /**
+   * Who muted this seat — only meaningful when `muted=true`.
+   *
+   *   • `self`  — the seat-holder muted themselves with the mic button.
+   *   • `host`  — owner or an admin force-muted the seat. Self-unmute is
+   *               blocked while this is the cause; the seat-holder must
+   *               wait for a host to lift it.
+   *   • `null`  — seat is unmuted (or was never muted).
+   *
+   * Cleared back to `null` whenever `muted` flips to false.
+   */
+  @Prop({ type: String, enum: ['self', 'host', null], default: null })
+  mutedBy!: 'self' | 'host' | null;
 
   /**
    * True when this seat is currently publishing video.
