@@ -58,16 +58,22 @@ export class RoomSeat {
   /**
    * Who muted this seat — only meaningful when `muted=true`.
    *
-   *   • `self`  — the seat-holder muted themselves with the mic button.
-   *   • `host`  — owner or an admin force-muted the seat. Self-unmute is
-   *               blocked while this is the cause; the seat-holder must
-   *               wait for a host to lift it.
-   *   • `null`  — seat is unmuted (or was never muted).
+   *   • `self`      — the seat-holder muted themselves with the mic
+   *                   button.
+   *   • `host`      — owner / admin **force-muted** the seat. The
+   *                   seat-holder cannot self-unmute while this is the
+   *                   cause; only a host can lift it.
+   *   • `host_soft` — owner / admin **soft-muted** the seat (a nudge:
+   *                   "please be quiet"). The seat-holder is muted
+   *                   right now, but can unmute themselves immediately
+   *                   if they want — the soft-mute is one-shot, not a
+   *                   lock.
+   *   • `null`      — seat is unmuted (or was never muted).
    *
    * Cleared back to `null` whenever `muted` flips to false.
    */
-  @Prop({ type: String, enum: ['self', 'host', null], default: null })
-  mutedBy!: 'self' | 'host' | null;
+  @Prop({ type: String, enum: ['self', 'host', 'host_soft', null], default: null })
+  mutedBy!: 'self' | 'host' | 'host_soft' | null;
 
   /**
    * True when this seat is currently publishing video.

@@ -265,6 +265,19 @@ export class RoomsController {
     return this.rooms.setSeatLocked(id, current.userId, seatIndex, false);
   }
 
+  /**
+   * Mute a seat. Two modes:
+   *
+   *   • `force` (default) — hard mute. A seat-holder cannot self-unmute
+   *     through it; only a host can lift it.
+   *   • `soft`            — host nudge. The seat-holder is muted right
+   *     now, but can flip their mic back on whenever they want. Only
+   *     honored when a moderator mutes someone OTHER than themselves —
+   *     a self-mute is always `self` regardless of `mode`.
+   *
+   * Body is optional so existing callers (no body) keep getting a
+   * force mute, matching the pre-`soft` behaviour.
+   */
   @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
   @Post(':id/seats/:seatIndex/mute')
@@ -272,8 +285,10 @@ export class RoomsController {
     @CurrentUser() current: AuthenticatedUser,
     @Param('id') id: string,
     @Param('seatIndex', ParseIntPipe) seatIndex: number,
+    @Body() body?: { soft?: boolean },
   ) {
-    return this.rooms.setSeatMuted(id, current.userId, seatIndex, true);
+    const mode = body?.soft === true ? 'soft' : 'force';
+    return this.rooms.setSeatMuted(id, current.userId, seatIndex, true, mode);
   }
 
   @UseGuards(JwtAuthGuard)

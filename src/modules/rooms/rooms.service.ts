@@ -1584,6 +1584,7 @@ export class RoomsService implements OnModuleInit {
     actorId: string,
     seatIndex: number,
     muted: boolean,
+    mode: 'force' | 'soft' = 'force',
   ) {
     if (!Types.ObjectId.isValid(actorId)) {
       throw new BadRequestException({
@@ -1648,14 +1649,20 @@ export class RoomsService implements OnModuleInit {
     // (which closes the unmute loophole above) even when `muted` was
     // already true.
     //
-    // `isSelf` wins over `isModerator`: a host muting THEIR OWN seat is
-    // a self-mute. Otherwise (a moderator acting on someone else's
-    // seat) it's a host-mute. Plain users acting on their own seat
-    // are obviously `self`.
-    const nextMutedBy: 'self' | 'host' | null = muted
+    //   • `isSelf` wins over `isModerator`: a host muting THEIR OWN
+    //     seat is a self-mute. Otherwise (a moderator acting on
+    //     someone else's seat) it's a host-mute. Plain users acting
+    //     on their own seat are obviously `self`.
+    //   • `mode='soft'` is only meaningful when a moderator acts on
+    //     someone else: it records the mute as a one-shot nudge that
+    //     the seat-holder can immediately undo. A self-mute is always
+    //     `self` regardless of `mode`.
+    const nextMutedBy: 'self' | 'host' | 'host_soft' | null = muted
       ? isSelf
         ? 'self'
-        : 'host'
+        : mode === 'soft'
+          ? 'host_soft'
+          : 'host'
       : null;
 
     if (seat.muted === muted && seat.mutedBy === nextMutedBy) {
