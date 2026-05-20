@@ -27,9 +27,49 @@ async function bootstrap() {
 
   app.use(helmet());
 
-  const corsOrigins = config.get<string>('cors.origin', '').split(',').filter(Boolean);
+  // CORS — supports literal origins AND regex patterns. Entries
+  // prefixed with `re:` are compiled to RegExp; anything else is
+  // matched literally. Lets the env keep a fixed list of prod
+  // origins while still allowing every dev machine on the LAN
+  // (192.168.x.x) and the Android emulator (10.0.2.2) to hit the
+  // API from a WebView-hosted game without re-editing the env on
+  // every Wi-Fi switch.
+  //
+  // Empty list → `origin: true` (mirror the request origin). Used
+  // only when CORS_ORIGIN is unset, which we don't do in any
+  // shipped environment but keeps `npm start` working out of the
+  // box for a fresh checkout.
+  const corsOriginsRaw = config
+    .get<string>('cors.origin', '')
+    .split(',')
+    .filter(Boolean);
+  const corsLiteral = new Set<string>();
+  const corsPatterns: RegExp[] = [];
+  for (const entry of corsOriginsRaw) {
+    if (entry.startsWith('re:')) {
+      try {
+        corsPatterns.push(new RegExp(entry.slice(3)));
+      } catch (err: any) {
+        // eslint-disable-next-line no-console
+        console.warn(`[cors] invalid regex ignored: ${entry}: ${err?.message}`);
+      }
+    } else {
+      corsLiteral.add(entry);
+    }
+  }
   app.enableCors({
-    origin: corsOrigins.length > 0 ? corsOrigins : true,
+    origin:
+      corsOriginsRaw.length === 0
+        ? true
+        : (origin, cb) => {
+            // Non-browser callers (curl, server-to-server, mobile
+            // app's Dart HttpClient) omit the Origin header — let
+            // those through. Browser preflights always set Origin.
+            if (!origin) return cb(null, true);
+            if (corsLiteral.has(origin)) return cb(null, true);
+            if (corsPatterns.some((re) => re.test(origin))) return cb(null, true);
+            return cb(new Error(`CORS: origin ${origin} not allowed`));
+          },
     credentials: true,
   });
 

@@ -55,6 +55,12 @@ export enum TxnType {
   /** One-shot monthly bonus claimed from the Live Record page
    *  once the host hits the valid-day threshold for the month. */
   LIVE_VALID_MONTH_BONUS = 'live_valid_month_bonus',
+  /** Bet placed on a wheel-betting game (Fruits Loop etc.).
+   *  Debit against the user's wallet at bet time. */
+  GAME_BET = 'game_bet',
+  /** Payout credited to a wheel-betting game winner after the
+   *  round resolves. */
+  GAME_PAYOUT = 'game_payout',
 }
 
 export enum TxnStatus {

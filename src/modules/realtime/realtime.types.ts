@@ -105,6 +105,26 @@ export enum RealtimeEventType {
   /** Free-form announcement banner from admin. */
   GLOBAL_ANNOUNCEMENT = 'global.announcement',
 
+  // ---------- Wheel-betting games (scope: `game:<gameKey>`) ----------
+  /** A new betting round has opened. Payload carries the full
+   *  round snapshot (items + timings) so a client subscribing
+   *  mid-round can paint without a separate fetch. */
+  GAME_ROUND_STARTED = 'game.round.started',
+  /** A bet just landed. Payload: `{ item, amount, betsByItem, betCount, totalBet }`.
+   *  Drives the live chip-stack visualisation on the wheel — we
+   *  echo aggregates so the UI never has to fan out per-user. */
+  GAME_BET_PLACED = 'game.bet.placed',
+  /** Betting closed for the current round; spin animation starts.
+   *  Payload: `{ winningItem, spinEndsAt }`. The winning item is
+   *  broadcast HERE (not in the result event) so the wheel
+   *  animation lands on the right slot — clients use the
+   *  remaining spin duration to drive the rotation. */
+  GAME_ROUND_SPINNING = 'game.round.spinning',
+  /** Spin animation ended; payouts have been credited. Payload:
+   *  `{ winningItem, totalPayout, winners: [{ userId, amount, payout }] }`.
+   *  Clients use this to flash winnings + update history. */
+  GAME_ROUND_RESULT = 'game.round.result',
+
   // ---------- User-scoped (1-1 messaging) ----------
   /** A 1-1 message landed for this user. Sent to BOTH participants on
    *  their respective `user:<id>` scopes — the recipient updates their
