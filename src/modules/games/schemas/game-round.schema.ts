@@ -129,6 +129,31 @@ export class GameRound {
    *  RESULT phase pays out. */
   @Prop({ type: Number, default: 0 })
   totalPayout!: number;
+
+  /** Winners of this round, enriched with a display name, persisted
+   *  once payouts settle. Drives the in-game "who won" popup (the
+   *  game polls /current, so it reads this off the round rather than
+   *  the realtime event). Capped + sorted by payout desc on write.
+   *  Empty until RESULT. Best-effort: a name-lookup failure leaves
+   *  this empty but never blocks payouts or round completion. */
+  @Prop({
+    type: [
+      {
+        userId: { type: String, required: true },
+        name: { type: String, required: true },
+        amount: { type: Number, required: true },
+        payout: { type: Number, required: true },
+        _id: false,
+      },
+    ],
+    default: [],
+  })
+  winners!: Array<{
+    userId: string;
+    name: string;
+    amount: number;
+    payout: number;
+  }>;
 }
 
 export const GameRoundSchema = SchemaFactory.createForClass(GameRound);

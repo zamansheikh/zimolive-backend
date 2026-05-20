@@ -11,6 +11,7 @@ import { Model, Types } from 'mongoose';
 
 import { RealtimeService } from '../realtime/realtime.service';
 import { RealtimeEventType } from '../realtime/realtime.types';
+import { User, UserDocument } from '../users/schemas/user.schema';
 import { Currency, TxnType } from '../wallet/schemas/transaction.schema';
 import { WalletService } from '../wallet/wallet.service';
 import { GameBet, GameBetDocument } from './schemas/game-bet.schema';
@@ -81,6 +82,8 @@ export class GamesService implements OnModuleInit {
     private readonly roundModel: Model<GameRoundDocument>,
     @InjectModel(GameBet.name)
     private readonly betModel: Model<GameBetDocument>,
+    @InjectModel(User.name)
+    private readonly userModel: Model<UserDocument>,
     private readonly wallet: WalletService,
     private readonly realtime: RealtimeService,
   ) {}
@@ -903,6 +906,30 @@ export class GamesService implements OnModuleInit {
       )
       .exec();
 
+    // Best-effort: enrich winners with display names + persist them on
+    // the round so the polling clients can render a "who won" popup.
+    // Isolated from the payout path above — a name-lookup failure here
+    // must never roll back wallet credits or block the next round.
+    let namedWinners = winners as Array<{
+      userId: string;
+      name?: string;
+      amount: number;
+      payout: number;
+    }>;
+    try {
+      const enriched = await this.enrichWinners(winners);
+      if (enriched.length) {
+        await this.roundModel
+          .updateOne({ _id: resulting._id }, { $set: { winners: enriched } })
+          .exec();
+        namedWinners = enriched;
+      }
+    } catch (err: any) {
+      this.log.warn(
+        `[${gameKey}] winner name enrichment failed (non-fatal): ${err?.message ?? err}`,
+      );
+    }
+
     void this.realtime.emit(
       `game:${gameKey}`,
       RealtimeEventType.GAME_ROUND_RESULT,
@@ -911,12 +938,45 @@ export class GamesService implements OnModuleInit {
         roundNumber: resulting.roundNumber,
         winningItem,
         totalPayout,
-        winners,
+        winners: namedWinners,
       },
     );
 
     // Schedule the next round after the intermission.
     void this.scheduleNextTransition(gameKey);
+  }
+
+  /**
+   * Resolve display names for a round's winners and return them
+   * sorted by payout (desc), capped. Pure read — used only to
+   * populate the round's `winners` array for the UI popup.
+   */
+  private async enrichWinners(
+    winners: Array<{ userId: string; amount: number; payout: number }>,
+  ): Promise<
+    Array<{ userId: string; name: string; amount: number; payout: number }>
+  > {
+    if (winners.length === 0) return [];
+    const ids = [...new Set(winners.map((w) => w.userId))];
+    const users = await this.userModel
+      .find({ _id: { $in: ids } })
+      .select('displayName username numericId')
+      .lean()
+      .exec();
+    const byId = new Map(
+      users.map((u: any) => [u._id.toString(), u]),
+    );
+    return winners
+      .map((w) => {
+        const u: any = byId.get(w.userId);
+        const name =
+          (u?.displayName && String(u.displayName).trim()) ||
+          (u?.username && String(u.username).trim()) ||
+          (u?.numericId ? `Player ${u.numericId}` : 'Player');
+        return { userId: w.userId, name, amount: w.amount, payout: w.payout };
+      })
+      .sort((a, b) => b.payout - a.payout)
+      .slice(0, 20);
   }
 
   /**

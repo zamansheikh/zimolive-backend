@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 
 import { RealtimeModule } from '../realtime/realtime.module';
+import { User, UserSchema } from '../users/schemas/user.schema';
 import { WalletModule } from '../wallet/wallet.module';
 import { GamesAdminController } from './games-admin.controller';
 import { GamesController } from './games.controller';
@@ -33,6 +34,10 @@ import {
       { name: GameConfig.name, schema: GameConfigSchema },
       { name: GameRound.name, schema: GameRoundSchema },
       { name: GameBet.name, schema: GameBetSchema },
+      // Read-only here — used to resolve winner display names for the
+      // "who won" popup. The model is owned by UsersModule; registering
+      // it again just gives this module a handle to the same collection.
+      { name: User.name, schema: UserSchema },
     ]),
     WalletModule,
     RealtimeModule,
