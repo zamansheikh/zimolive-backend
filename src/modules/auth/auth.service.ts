@@ -208,6 +208,96 @@ export class AuthService {
     return { user, tokens, isNewUser };
   }
 
+  /**
+   * Report whether the caller has an email-login password set, plus
+   * the email it would log in with. Drives the app settings UI so it
+   * can show "Set password" (first time) vs "Change password".
+   */
+  async getPasswordStatus(
+    userId: string,
+  ): Promise<{ hasPassword: boolean; email: string | null }> {
+    const user = await this.users.findByIdWithPassword(userId);
+    if (!user) {
+      throw new UnauthorizedException({
+        code: 'USER_NOT_FOUND',
+        message: 'User not found',
+      });
+    }
+    return {
+      hasPassword: Boolean(user.passwordHash),
+      email: user.email ?? null,
+    };
+  }
+
+  /**
+   * Set or change the caller's email-login password.
+   *
+   * - First-time set (Google / phone account with no password): the
+   *   JWT on the request is proof of identity, so `currentPassword`
+   *   is not required. The account MUST already have an email, since
+   *   email + password is what login/email checks — without one the
+   *   new password would be unusable.
+   * - Change (account already has a password): `currentPassword` is
+   *   required and must match.
+   *
+   * After this succeeds the user can sign in with email + password
+   * anywhere that hits POST /auth/login/email — the mobile app's
+   * email login AND the games web lobby — with no further changes,
+   * because login/email already authenticates any user that has a
+   * matching email + passwordHash.
+   */
+  async setPassword(params: {
+    userId: string;
+    newPassword: string;
+    currentPassword?: string;
+  }): Promise<{ hasPassword: true; email: string }> {
+    const user = await this.users.findByIdWithPassword(params.userId);
+    if (!user) {
+      throw new UnauthorizedException({
+        code: 'USER_NOT_FOUND',
+        message: 'User not found',
+      });
+    }
+    this.assertActive(user);
+
+    if (!user.email) {
+      // No email on the account → email+password login can't work.
+      // (Phone-only signups land here; they'd need to add an email
+      // first, which is a separate flow.)
+      throw new BadRequestException({
+        code: 'NO_EMAIL_ON_ACCOUNT',
+        message:
+          'Your account has no email address, so an email password can’t be set.',
+      });
+    }
+
+    if (user.passwordHash) {
+      // Change flow — must prove knowledge of the current password.
+      if (!params.currentPassword) {
+        throw new BadRequestException({
+          code: 'CURRENT_PASSWORD_REQUIRED',
+          message: 'Enter your current password to change it.',
+        });
+      }
+      const matches = await bcrypt.compare(
+        params.currentPassword,
+        user.passwordHash,
+      );
+      if (!matches) {
+        throw new UnauthorizedException({
+          code: 'INVALID_CURRENT_PASSWORD',
+          message: 'Current password is incorrect.',
+        });
+      }
+    }
+
+    const rounds = this.config.get<number>('security.bcryptRounds', 12);
+    const passwordHash = await bcrypt.hash(params.newPassword, rounds);
+    await this.users.setPasswordHash(user._id.toString(), passwordHash);
+
+    return { hasPassword: true, email: user.email };
+  }
+
   async refresh(refreshToken: string, context?: AuthContext): Promise<TokenPair> {
     return this.tokens.rotate(refreshToken, context);
   }

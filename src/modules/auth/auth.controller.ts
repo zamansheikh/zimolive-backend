@@ -12,6 +12,7 @@ import { LoginEmailDto } from './dto/login-email.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { RegisterEmailDto } from './dto/register-email.dto';
 import { SendOtpDto } from './dto/send-otp.dto';
+import { SetPasswordDto } from './dto/set-password.dto';
 import { VerifyOtpDto } from './dto/verify-otp.dto';
 
 @Controller({ path: 'auth', version: '1' })
@@ -97,6 +98,36 @@ export class AuthController {
   async logout(@Body() dto: RefreshTokenDto) {
     await this.auth.logout(dto.refreshToken);
     return { success: true };
+  }
+
+  /**
+   * Whether the caller has an email-login password set (+ the email
+   * it'd use). The app settings screen reads this to label the row
+   * "Set password" vs "Change password".
+   */
+  @Get('password-status')
+  async passwordStatus(@CurrentUser() current: AuthenticatedUser) {
+    return this.auth.getPasswordStatus(current.userId);
+  }
+
+  /**
+   * Set or change the caller's email-login password. Lets a Google /
+   * phone user create an email + password credential so they can ALSO
+   * log in with email + password — in the app and the games web lobby.
+   * `currentPassword` is required only when changing an existing one.
+   */
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @HttpCode(HttpStatus.OK)
+  @Post('set-password')
+  async setPassword(
+    @CurrentUser() current: AuthenticatedUser,
+    @Body() dto: SetPasswordDto,
+  ) {
+    return this.auth.setPassword({
+      userId: current.userId,
+      newPassword: dto.newPassword,
+      currentPassword: dto.currentPassword,
+    });
   }
 
   @Get('me')

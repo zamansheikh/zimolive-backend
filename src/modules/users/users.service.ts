@@ -143,6 +143,31 @@ export class UsersService {
     return user;
   }
 
+  /** Like findById but with the (normally `select: false`) passwordHash
+   *  loaded — for verifying the current password on a change and for
+   *  the "does this account have a password yet?" check. */
+  async findByIdWithPassword(id: string): Promise<UserDocument | null> {
+    if (!Types.ObjectId.isValid(id)) return null;
+    return this.userModel.findById(id).select('+passwordHash').exec();
+  }
+
+  /** Set (or replace) the account's email-login password hash and make
+   *  sure the EMAIL provider is recorded — so a Google/phone-only user
+   *  who sets a password can now sign in with email + password too.
+   *  Doesn't touch googleId/phone, so existing sign-in methods keep
+   *  working alongside the new one. */
+  async setPasswordHash(userId: string, passwordHash: string): Promise<void> {
+    await this.userModel
+      .updateOne(
+        { _id: userId },
+        {
+          $set: { passwordHash },
+          $addToSet: { providers: AuthProvider.EMAIL },
+        },
+      )
+      .exec();
+  }
+
   async createWithEmail(params: {
     email: string;
     passwordHash: string;
