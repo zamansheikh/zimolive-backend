@@ -14,17 +14,30 @@ import {
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import {
+  BadRequestException,
   Body,
   Controller,
   Delete,
   Get,
+  HttpCode,
+  HttpStatus,
   Param,
   Patch,
   Post,
+  UploadedFile,
+  UseInterceptors,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 
 import { AdminOnly } from '../admin/admin-auth/decorators/admin-only.decorator';
+import { MediaService } from '../media/media.service';
 import { GamesService } from './games.service';
+
+// Game tile / banner art is small — cap uploads so a stray huge file
+// can't tie up Cloudinary or the request. 4 MB comfortably covers a
+// crisp icon or a 3:2 hero PNG.
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
 
 class GameItemDto {
   @IsString()
@@ -203,7 +216,51 @@ class CreateGameConfigDto {
 @Controller({ path: 'admin/games', version: '1' })
 @AdminOnly()
 export class GamesAdminController {
-  constructor(private readonly svc: GamesService) {}
+  constructor(
+    private readonly svc: GamesService,
+    private readonly media: MediaService,
+  ) {}
+
+  /**
+   * Upload a game icon or banner to Cloudinary and return its URL +
+   * publicId. The admin Games form posts a `file` field here and
+   * stores the returned `url` in the config's iconUrl / bannerUrl.
+   * `kind` (icon | banner) only picks the Cloudinary subfolder so the
+   * two asset types stay organised.
+   */
+  @HttpCode(HttpStatus.OK)
+  @Post('upload/:kind')
+  @UseInterceptors(
+    FileInterceptor('file', { limits: { fileSize: MAX_IMAGE_BYTES } }),
+  )
+  async uploadAsset(
+    @Param('kind') kind: string,
+    @UploadedFile() file?: Express.Multer.File,
+  ) {
+    if (kind !== 'icon' && kind !== 'banner') {
+      throw new BadRequestException({
+        code: 'INVALID_ASSET_KIND',
+        message: 'kind must be "icon" or "banner"',
+      });
+    }
+    if (!file) {
+      throw new BadRequestException({
+        code: 'FILE_REQUIRED',
+        message: 'File required',
+      });
+    }
+    if (!IMAGE_TYPES.includes(file.mimetype)) {
+      throw new BadRequestException({
+        code: 'INVALID_FILE_TYPE',
+        message: `Image must be one of ${IMAGE_TYPES.join(', ')}`,
+        details: { received: file.mimetype },
+      });
+    }
+    const result = await this.media.uploadImage(file.buffer, {
+      folder: `games/${kind}s`,
+    });
+    return { url: result.secure_url, publicId: result.public_id };
+  }
 
   @Get()
   async list() {
