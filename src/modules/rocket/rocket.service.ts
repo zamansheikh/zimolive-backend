@@ -331,6 +331,27 @@ export class RocketService {
       .exec();
     if (!fresh) return;
 
+    // Self-heal a stranded level. If the room's saved `currentLevel` no
+    // longer exists in the config — which happens when an admin removes
+    // or renumbers levels AFTER this room had already climbed past them —
+    // the room would otherwise be stuck forever: the launch check below
+    // can't match a level, so it never launches and never loops, while
+    // energy keeps piling up. Snap back to the lowest configured level so
+    // the cycle resumes (the leftover energy carries straight into it).
+    if (!config.levels.some((l) => l.level === fresh.currentLevel)) {
+      const lowest = [...config.levels].sort((a, b) => a.level - b.level)[0];
+      await this.stateModel
+        .updateOne(
+          { _id: fresh._id },
+          { $set: { currentLevel: lowest.level } },
+        )
+        .exec();
+      fresh.currentLevel = lowest.level;
+      this.log.warn(
+        `Rocket room ${roomId} was stranded on missing level — snapped to L${lowest.level}`,
+      );
+    }
+
     // Live fuel-update broadcast — fires on EVERY successful gift so
     // the in-room gauge animates in real time. Uses the post-increment
     // values so the client doesn't have to reconcile against a stale
@@ -354,13 +375,29 @@ export class RocketService {
       }
     }
 
-    // Skip the flip only if a launch is ALREADY mid-countdown — that's
-    // the only state we need to leave alone. IDLE is the normal path;
-    // COMPLETE is a legacy stuck state from before the wrap-around
-    // landed and we want the next gift to unstick it back into the
-    // cycle. With wrap-around, COMPLETE is no longer produced by
-    // launchOne, but old state docs in the DB still need an escape.
-    if (fresh.status === RocketStatus.COUNTDOWN) return;
+    // A launch is ALREADY mid-countdown. Normally the cron sweeper fires
+    // it once the countdown elapses, and we leave it alone here. BUT if
+    // the countdown is already OVERDUE — the sweeper missed a tick, isn't
+    // running in this environment, or the countdown ended between ticks —
+    // launch it inline from the gift path. This guarantees a gift always
+    // *does something* and the rocket can never wedge in COUNTDOWN
+    // forever. launchOne's atomic `status: COUNTDOWN` filter means a race
+    // with the cron can't double-launch (only one update wins).
+    if (fresh.status === RocketStatus.COUNTDOWN) {
+      const dueAtMs =
+        (fresh.countdownStartedAt?.getTime() ?? Date.now()) +
+        config.launchCountdownSeconds * 1000;
+      if (Date.now() >= dueAtMs) {
+        try {
+          await this.launchOne(fresh, config);
+        } catch (err: any) {
+          this.log.error(
+            `Inline overdue launch failed (room=${roomId}): ${err?.message ?? err}`,
+          );
+        }
+      }
+      return;
+    }
 
     const lv = config.levels.find((l) => l.level === fresh.currentLevel);
     if (!lv) return; // out of levels — admin removed all levels
@@ -393,6 +430,8 @@ export class RocketService {
       level: fresh.currentLevel,
       countdownSeconds: config.launchCountdownSeconds,
       stage: 'countdown',
+      assetUrl: lv.assetUrl,
+      iconUrl: lv.iconUrl,
     });
     // Also a global banner so users in other rooms see the rocket
     // about to launch and can hop in.
@@ -462,16 +501,26 @@ export class RocketService {
     state: RocketRoomStateDocument,
     config: RocketConfigDocument,
   ): Promise<void> {
-    const lv = config.levels.find((l) => l.level === state.currentLevel);
+    let lv = config.levels.find((l) => l.level === state.currentLevel);
     if (!lv) {
-      // Out of levels — mark complete and bail.
-      await this.stateModel
-        .updateOne(
-          { _id: state._id, status: RocketStatus.COUNTDOWN },
-          { $set: { status: RocketStatus.COMPLETE } },
-        )
-        .exec();
-      return;
+      // The saved level vanished from the config (admin edit) between the
+      // countdown flip and this sweep. Snap to the lowest configured level
+      // and launch that instead of dead-ending, so the room keeps cycling.
+      const lowest = config.levels.length
+        ? [...config.levels].sort((a, b) => a.level - b.level)[0]
+        : null;
+      if (!lowest) {
+        // No levels at all — nothing to launch. Park it.
+        await this.stateModel
+          .updateOne(
+            { _id: state._id, status: RocketStatus.COUNTDOWN },
+            { $set: { status: RocketStatus.COMPLETE } },
+          )
+          .exec();
+        return;
+      }
+      state.currentLevel = lowest.level;
+      lv = lowest;
     }
 
     // 1. Resolve top-3 contributors (only those above threshold).
@@ -687,6 +736,11 @@ export class RocketService {
         roomId: roomIdStr,
         level: lv.level,
         stage: 'launched',
+        // Launch animation + thumbnail for THIS level so the room can
+        // play the rocket overlay (SVGA / image). Admin sets these per
+        // level in the rocket config.
+        assetUrl: lv.assetUrl,
+        iconUrl: lv.iconUrl,
         topContributors: top.map((t) => ({
           userId: t.userId.toString(),
           user: hydrate(t.userId),
@@ -736,6 +790,10 @@ export class RocketService {
           waitSeconds: cascadeWaitSeconds,
           stage: 'countdown',
           cascade: true,
+          // Next level's art so the room countdown can show the right
+          // rocket icon instead of the glyph fallback.
+          assetUrl: nextLv.assetUrl,
+          iconUrl: nextLv.iconUrl,
         },
       );
       // Global cascade banner — same treatment as the first launch so
