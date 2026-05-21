@@ -160,3 +160,6 @@ export const GameRoundSchema = SchemaFactory.createForClass(GameRound);
 // Cheap lookup of the "current" / "most recent" round per game.
 GameRoundSchema.index({ gameKey: 1, roundNumber: -1 });
 GameRoundSchema.index({ gameKey: 1, phase: 1 });
+// 30-day retention sweep deletes rounds by age — keeps the daily
+// `deleteMany({ createdAt: { $lt: cutoff } })` index-backed and cheap.
+GameRoundSchema.index({ createdAt: 1 });

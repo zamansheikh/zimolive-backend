@@ -6,6 +6,7 @@ import { User, UserSchema } from '../users/schemas/user.schema';
 import { WalletModule } from '../wallet/wallet.module';
 import { GamesAdminController } from './games-admin.controller';
 import { GamesController } from './games.controller';
+import { GamesCron } from './games.cron';
 import { GamesService } from './games.service';
 import { GameBet, GameBetSchema } from './schemas/game-bet.schema';
 import {
@@ -43,7 +44,7 @@ import {
     RealtimeModule,
   ],
   controllers: [GamesController, GamesAdminController],
-  providers: [GamesService],
+  providers: [GamesService, GamesCron],
   exports: [GamesService],
 })
 export class GamesModule {}

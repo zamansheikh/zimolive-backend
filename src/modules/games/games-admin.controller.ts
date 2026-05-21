@@ -24,6 +24,7 @@ import {
   Param,
   Patch,
   Post,
+  Query,
   UploadedFile,
   UseInterceptors,
 } from '@nestjs/common';
@@ -299,6 +300,39 @@ export class GamesAdminController {
   async history(@Param('gameKey') gameKey: string) {
     const rounds = await this.svc.listHistory(gameKey, 50);
     return { rounds };
+  }
+
+  /**
+   * Per-user game history for support / complaint investigation. Returns a
+   * paginated list of the user's bets (wager, item, win/loss, payout, time,
+   * round #) plus a summary (wagered / won / net) over the filter. Optional
+   * `gameKey` narrows to one game; `from`/`to` (ISO dates) bound the window.
+   *
+   * Lives under a 3-segment path so it never collides with the
+   * `:gameKey/...` routes above.
+   */
+  @Get('history/user/:userId')
+  async userHistory(
+    @Param('userId') userId: string,
+    @Query('gameKey') gameKey?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    const parseDate = (s?: string): Date | undefined => {
+      if (!s) return undefined;
+      const d = new Date(s);
+      return Number.isNaN(d.getTime()) ? undefined : d;
+    };
+    return this.svc.listUserBets({
+      userId,
+      gameKey: gameKey || undefined,
+      from: parseDate(from),
+      to: parseDate(to),
+      page: page ? parseInt(page, 10) : undefined,
+      limit: limit ? parseInt(limit, 10) : undefined,
+    });
   }
 
   /**

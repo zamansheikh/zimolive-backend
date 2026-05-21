@@ -442,6 +442,147 @@ export class GamesService implements OnModuleInit {
       .exec() as any;
   }
 
+  /**
+   * Admin: one user's bet history across all games (or filtered to one
+   * game / date range), newest first, paginated. Each bet row already
+   * carries the wager, the item, the payout (0 = loss) and the wallet txn
+   * ids, so this is the full "what happened" record for a complaint.
+   *
+   * Returns the page + total count + a summary (wagered / won / net / win
+   * count) over the SAME filter. Backed by the `{ userId, createdAt }`
+   * index so it stays cheap on a large history.
+   */
+  async listUserBets(params: {
+    userId: string;
+    gameKey?: string;
+    from?: Date;
+    to?: Date;
+    page?: number;
+    limit?: number;
+  }): Promise<{
+    bets: GameBetDocument[];
+    total: number;
+    page: number;
+    limit: number;
+    summary: {
+      totalWagered: number;
+      totalWon: number;
+      net: number;
+      betCount: number;
+      wins: number;
+    };
+  }> {
+    const page = Math.max(1, Math.floor(params.page ?? 1));
+    const limit = Math.min(100, Math.max(1, Math.floor(params.limit ?? 20)));
+    const emptySummary = {
+      totalWagered: 0,
+      totalWon: 0,
+      net: 0,
+      betCount: 0,
+      wins: 0,
+    };
+    if (!Types.ObjectId.isValid(params.userId)) {
+      return { bets: [], total: 0, page, limit, summary: emptySummary };
+    }
+
+    const filter: Record<string, unknown> = {
+      userId: new Types.ObjectId(params.userId),
+    };
+    if (params.gameKey) filter.gameKey = params.gameKey;
+    if (params.from || params.to) {
+      const range: Record<string, Date> = {};
+      if (params.from) range.$gte = params.from;
+      if (params.to) range.$lte = params.to;
+      filter.createdAt = range;
+    }
+
+    const [bets, total, agg] = await Promise.all([
+      this.betModel
+        .find(filter)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean()
+        .exec(),
+      this.betModel.countDocuments(filter).exec(),
+      this.betModel
+        .aggregate([
+          { $match: filter },
+          {
+            $group: {
+              _id: null,
+              totalWagered: { $sum: '$amount' },
+              totalWon: { $sum: '$payoutAmount' },
+              betCount: { $sum: 1 },
+              wins: {
+                $sum: { $cond: [{ $gt: ['$payoutAmount', 0] }, 1, 0] },
+              },
+            },
+          },
+        ])
+        .exec(),
+    ]);
+
+    const a = (agg[0] as Record<string, number> | undefined) ?? {};
+    const totalWagered = a.totalWagered ?? 0;
+    const totalWon = a.totalWon ?? 0;
+    return {
+      bets: bets as any,
+      total,
+      page,
+      limit,
+      summary: {
+        totalWagered,
+        totalWon,
+        net: totalWon - totalWagered,
+        betCount: a.betCount ?? 0,
+        wins: a.wins ?? 0,
+      },
+    };
+  }
+
+  /**
+   * Retention: delete game history (bets + rounds) older than
+   * `olderThanDays` (default 30). Deletes in bounded batches so a huge
+   * backlog never locks the DB with one giant `deleteMany`. The wallet
+   * ledger is intentionally left untouched — money truth lives there.
+   * Returns counts for cron logging.
+   */
+  async purgeOldHistory(
+    olderThanDays = 30,
+  ): Promise<{ bets: number; rounds: number }> {
+    const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000);
+    const bets = await this.deleteOlderThan(this.betModel, cutoff);
+    const rounds = await this.deleteOlderThan(this.roundModel, cutoff);
+    return { bets, rounds };
+  }
+
+  /** Delete `createdAt < cutoff` docs in batches of `batch`, oldest first. */
+  private async deleteOlderThan(
+    model: Model<any>,
+    cutoff: Date,
+    batch = 5000,
+  ): Promise<number> {
+    let deleted = 0;
+    // Hard cap the loop so a runaway can't spin forever.
+    for (let i = 0; i < 10_000; i++) {
+      const ids = await model
+        .find({ createdAt: { $lt: cutoff } })
+        .select({ _id: 1 })
+        .sort({ createdAt: 1 })
+        .limit(batch)
+        .lean()
+        .exec();
+      if (ids.length === 0) break;
+      const res = await model
+        .deleteMany({ _id: { $in: ids.map((d: any) => d._id) } })
+        .exec();
+      deleted += res.deletedCount ?? 0;
+      if (ids.length < batch) break;
+    }
+    return deleted;
+  }
+
   // ============================================================
   // Bet placement
   // ============================================================

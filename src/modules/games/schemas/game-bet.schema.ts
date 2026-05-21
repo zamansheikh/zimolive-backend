@@ -75,3 +75,9 @@ export class GameBet {
 export const GameBetSchema = SchemaFactory.createForClass(GameBet);
 GameBetSchema.index({ roundId: 1, item: 1 });
 GameBetSchema.index({ userId: 1, gameKey: 1, createdAt: -1 });
+// Admin per-user history ACROSS all games — index-ordered newest-first so the
+// paginated lookup never has to in-memory sort a big history.
+GameBetSchema.index({ userId: 1, createdAt: -1 });
+// 30-day retention sweep deletes by age; a standalone createdAt index keeps
+// the daily `deleteMany({ createdAt: { $lt: cutoff } })` cheap.
+GameBetSchema.index({ createdAt: 1 });
