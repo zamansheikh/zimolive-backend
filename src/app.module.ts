@@ -37,6 +37,7 @@ import { RoomEmojisModule } from './modules/room-emojis/room-emojis.module';
 import { RoomSupportModule } from './modules/room-support/room-support.module';
 import { HonorsModule } from './modules/honors/honors.module';
 import { GamesModule } from './modules/games/games.module';
+import { DashboardModule } from './modules/admin/dashboard/dashboard.module';
 import { LiveRecordModule } from './modules/live-record/live-record.module';
 import { RankingsModule } from './modules/rankings/rankings.module';
 import { RoomsModule } from './modules/rooms/rooms.module';
@@ -127,6 +128,7 @@ import { WalletModule } from './modules/wallet/wallet.module';
     RoomsModule,
     LiveRecordModule,
     GamesModule,
+    DashboardModule,
     RoomSupportModule,
     MessagesModule,
     FcmModule,
