@@ -104,6 +104,13 @@ export class WalletOptionsService {
     if (update.badgeText !== undefined) p.badgeText = update.badgeText;
     if (update.sortOrder !== undefined) p.sortOrder = update.sortOrder;
     if (update.active !== undefined) p.active = update.active;
+    if (update.googleProductId !== undefined)
+      p.googleProductId = update.googleProductId;
+    if (update.appleProductId !== undefined)
+      p.appleProductId = update.appleProductId;
+    if (update.isOffer !== undefined) p.isOffer = update.isOffer;
+    if (update.originalPriceAmount !== undefined)
+      p.originalPriceAmount = update.originalPriceAmount;
     if (update.startDate !== undefined)
       p.startDate = update.startDate ? new Date(update.startDate) : null;
     if (update.endDate !== undefined)

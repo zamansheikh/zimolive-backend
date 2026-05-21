@@ -49,6 +49,28 @@ export class CreateRechargePackageDto {
   @IsOptional()
   @IsDateString()
   endDate?: string;
+
+  /** Google Play / App Store in-app product ids the purchase maps back to. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(160)
+  googleProductId?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(160)
+  appleProductId?: string;
+
+  /** Mark as a limited-time special offer (own highlighted strip in-app). */
+  @IsOptional()
+  @IsBoolean()
+  isOffer?: boolean;
+
+  /** "Was" price for the struck-through original (0 = none). */
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  originalPriceAmount?: number;
 }
 
 export class UpdateRechargePackageDto {
@@ -92,6 +114,25 @@ export class UpdateRechargePackageDto {
   @IsOptional()
   @IsDateString()
   endDate?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(160)
+  googleProductId?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(160)
+  appleProductId?: string;
+
+  @IsOptional()
+  @IsBoolean()
+  isOffer?: boolean;
+
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  originalPriceAmount?: number;
 }
 
 export class CreateExchangeOptionDto {

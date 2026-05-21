@@ -43,6 +43,24 @@ export class RechargePackage {
   badgeText!: string;
 
   /**
+   * Marks a LIMITED-TIME special offer (e.g. "huge coins, very cheap").
+   * Offer packages are surfaced in their own highlighted strip at the top
+   * of the wallet, separate from the standard recharge grid, and are
+   * usually time-boxed via `startDate`/`endDate`. Default false = ordinary
+   * always-on package.
+   */
+  @Prop({ type: Boolean, default: false, index: true })
+  isOffer!: boolean;
+
+  /**
+   * "Was" price for an offer, used to render a struck-through original
+   * price next to the discounted `priceAmount` (e.g. ~~650~~ 65). 0 = no
+   * comparison shown. Same currency as `priceAmount`.
+   */
+  @Prop({ type: Number, default: 0, min: 0 })
+  originalPriceAmount!: number;
+
+  /**
    * Google Play in-app product id (the one set up in Play Console
    * Monetization → Products → In-app products). RevenueCat is the SDK
    * we use to drive billing, but the *product* still lives in the
