@@ -17,18 +17,27 @@ import { RocketService } from './rocket.service';
 @Injectable()
 export class RocketCron {
   private readonly log = new Logger('RocketCron');
+  private _ticks = 0;
 
-  constructor(private readonly rocket: RocketService) {}
+  constructor(private readonly rocket: RocketService) {
+    this.log.log('RocketCron constructed — sweeper will run every 5s');
+  }
 
   @Cron(CronExpression.EVERY_5_SECONDS)
   async tick(): Promise<void> {
+    // Liveness heartbeat: log the very first tick (proves the @Cron is
+    // firing in this environment) then only hourly to avoid log spam.
+    this._ticks += 1;
+    if (this._ticks === 1 || this._ticks % 720 === 0) {
+      this.log.log(`RocketCron alive (tick #${this._ticks})`);
+    }
     try {
-      const launched = await this.rocket.sweepDueLaunches();
-      if (launched > 0) {
-        this.log.log(`Launched ${launched} rocket(s)`);
+      const advanced = await this.rocket.sweepDueLaunches();
+      if (advanced > 0) {
+        this.log.log(`RocketCron advanced ${advanced} room(s)`);
       }
     } catch (err: any) {
-      this.log.error(`Sweep failed: ${err?.message ?? err}`);
+      this.log.error(`Sweep failed: ${err?.message ?? err}`, err?.stack);
     }
   }
 

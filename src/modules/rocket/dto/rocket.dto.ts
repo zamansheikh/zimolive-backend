@@ -69,6 +69,12 @@ export class UpdateRocketConfigDto {
 
   @IsOptional()
   @IsInt()
+  @Min(3)
+  @Max(60)
+  bannerSeconds?: number;
+
+  @IsOptional()
+  @IsInt()
   @Min(1)
   @Max(120)
   launchCountdownSeconds?: number;

@@ -93,18 +93,26 @@ export class RocketConfig {
   topContributionThreshold!: number;
 
   /**
-   * Seconds between threshold-cross and the actual launch. Long enough
-   * for users in other rooms to see the global banner and hop in to
-   * collect rewards — default 20s.
+   * BANNER phase length: how long the global banner gathers the platform
+   * into the room BEFORE the in-room countdown starts (rocket-system.md §7).
+   * No animation plays during this window. Default 10s.
    */
-  @Prop({ type: Number, default: 20, min: 1, max: 120 })
+  @Prop({ type: Number, default: 10, min: 3, max: 60 })
+  bannerSeconds!: number;
+
+  /**
+   * COUNTDOWN phase length: the in-room countdown after the banner, during
+   * which the launch video downloads so playback is smooth. The animation
+   * fires when it elapses. Default 15s. (Clients also wait for the download
+   * to finish, so this should comfortably cover a normal video fetch.)
+   */
+  @Prop({ type: Number, default: 15, min: 1, max: 120 })
   launchCountdownSeconds!: number;
 
   /**
-   * Spacing between two cascading launches when one big gift fills
-   * multiple levels at once. The next rocket fires this many seconds
-   * after the previous one's actual launch, so the room can see each
-   * launch animation play out before the next begins.
+   * @deprecated Pre-queue model. Stacked launches now run as a strict
+   * sequential queue (each fully finishes before the next banner), so there
+   * is no fixed cascade gap. Kept so existing config rows deserialize.
    */
   @Prop({ type: Number, default: 30, min: 5, max: 300 })
   cascadeDelaySeconds!: number;

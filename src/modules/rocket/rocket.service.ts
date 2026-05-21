@@ -35,6 +35,13 @@ import {
 const TZ_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
 const SINGLETON_KEY = 'singleton';
 
+/**
+ * A RoomMember counts as "present" for winner selection if its heartbeat is
+ * newer than this. Rows are removed on leave, so this just drops crashed /
+ * zombie clients — the live audience the banner gathered.
+ */
+const PRESENCE_WINDOW_MS = 5 * 60 * 1000;
+
 const DEFAULT_LEVELS: RocketLevel[] = [
   {
     level: 1,
@@ -102,7 +109,8 @@ export class RocketService {
             enabled: true,
             timezone: 'Asia/Dhaka',
             topContributionThreshold: 120_000,
-            launchCountdownSeconds: 20,
+            bannerSeconds: 10,
+            launchCountdownSeconds: 15,
             cascadeDelaySeconds: 30,
             levels: DEFAULT_LEVELS,
           },
@@ -116,6 +124,7 @@ export class RocketService {
     enabled?: boolean;
     timezone?: string;
     topContributionThreshold?: number;
+    bannerSeconds?: number;
     launchCountdownSeconds?: number;
     cascadeDelaySeconds?: number;
     /** assetUrl + iconUrl optional on input — server falls back to ''. */
@@ -157,6 +166,9 @@ export class RocketService {
     if (update.timezone !== undefined) set.timezone = update.timezone;
     if (update.topContributionThreshold !== undefined) {
       set.topContributionThreshold = update.topContributionThreshold;
+    }
+    if (update.bannerSeconds !== undefined) {
+      set.bannerSeconds = update.bannerSeconds;
     }
     if (update.launchCountdownSeconds !== undefined) {
       set.launchCountdownSeconds = update.launchCountdownSeconds;
@@ -375,90 +387,20 @@ export class RocketService {
       }
     }
 
-    // A launch is ALREADY mid-countdown. Normally the cron sweeper fires
-    // it once the countdown elapses, and we leave it alone here. BUT if
-    // the countdown is already OVERDUE — the sweeper missed a tick, isn't
-    // running in this environment, or the countdown ended between ticks —
-    // launch it inline from the gift path. This guarantees a gift always
-    // *does something* and the rocket can never wedge in COUNTDOWN
-    // forever. launchOne's atomic `status: COUNTDOWN` filter means a race
-    // with the cron can't double-launch (only one update wins).
-    if (fresh.status === RocketStatus.COUNTDOWN) {
-      const dueAtMs =
-        (fresh.countdownStartedAt?.getTime() ?? Date.now()) +
-        config.launchCountdownSeconds * 1000;
-      if (Date.now() >= dueAtMs) {
-        try {
-          await this.launchOne(fresh, config);
-        } catch (err: any) {
-          this.log.error(
-            `Inline overdue launch failed (room=${roomId}): ${err?.message ?? err}`,
-          );
-        }
-      }
-      return;
+    // Drive the phase machine. If a launch cycle is already running
+    // (BANNER/COUNTDOWN), this nudges it forward whenever a phase is due —
+    // so gifts keep the rocket moving even if the cron sweeper lags. If the
+    // room is IDLE and this gift just filled the current level, it kicks off
+    // a new cycle (resolve the launch queue → start the banner). Every
+    // transition is status-guarded, so it's safe to run alongside the cron.
+    try {
+      await this.advanceRoom(fresh, config);
+    } catch (err: any) {
+      this.log.error(
+        `advanceRoom failed (room=${roomId}): ${err?.message ?? err}`,
+        err?.stack,
+      );
     }
-
-    const lv = config.levels.find((l) => l.level === fresh.currentLevel);
-    if (!lv) return; // out of levels — admin removed all levels
-
-    if (fresh.currentEnergy < lv.energyRequired) return; // still filling
-
-    // Atomic flip — ensures only one concurrent caller wins the launch.
-    // Accepts both IDLE and the legacy COMPLETE so stuck rows return
-    // to the cycle on the next gift instead of waiting for the day
-    // boundary.
-    const flip = await this.stateModel
-      .updateOne(
-        {
-          _id: fresh._id,
-          status: { $in: [RocketStatus.IDLE, RocketStatus.COMPLETE] },
-        },
-        {
-          $set: {
-            status: RocketStatus.COUNTDOWN,
-            countdownStartedAt: new Date(),
-          },
-        },
-      )
-      .exec();
-    if (flip.modifiedCount === 0) return;
-
-    // Broadcast — room listeners render the launch countdown overlay.
-    void this.realtime.emitToRoom(roomId, RealtimeEventType.ROOM_ROCKET_LAUNCH, {
-      roomId,
-      level: fresh.currentLevel,
-      countdownSeconds: config.launchCountdownSeconds,
-      stage: 'countdown',
-      assetUrl: lv.assetUrl,
-      iconUrl: lv.iconUrl,
-    });
-    // Also a global banner so users in other rooms see the rocket
-    // about to launch and can hop in.
-    const [room, sender] = await Promise.all([
-      this.roomModel
-        .findById(roomOid)
-        .select({ name: 1, numericId: 1 })
-        .exec(),
-      this.userModel
-        .findById(senderOid)
-        .select({ displayName: 1, username: 1, avatarUrl: 1 })
-        .exec(),
-    ]);
-    void this.realtime.emitGlobal(
-      RealtimeEventType.GLOBAL_ROCKET_BANNER,
-      {
-        roomId,
-        roomName: room?.name ?? '',
-        level: fresh.currentLevel,
-        triggeredById: senderId,
-        triggeredByName: sender?.displayName?.trim().length
-          ? sender!.displayName
-          : (sender?.username ?? 'Someone'),
-        triggeredByAvatarUrl: sender?.avatarUrl ?? '',
-        countdownSeconds: config.launchCountdownSeconds,
-      },
-    );
   }
 
   // ============================================================
@@ -473,136 +415,252 @@ export class RocketService {
    */
   async sweepDueLaunches(now: Date = new Date()): Promise<number> {
     const config = await this.getConfig();
-    const cutoff = new Date(
-      now.getTime() - config.launchCountdownSeconds * 1000,
-    );
-    const due = await this.stateModel
-      .find({
-        status: RocketStatus.COUNTDOWN,
-        countdownStartedAt: { $lte: cutoff, $ne: null },
-      })
+    if (!config.enabled || config.levels.length === 0) return 0;
+    // Drive every room mid-cycle (BANNER or COUNTDOWN) to wherever `now` says
+    // it should be. IDLE rooms are kicked off by the gift path; leftover fuel
+    // is handled by the post-launch loop inside advanceRoom.
+    const active = await this.stateModel
+      .find({ status: { $in: [RocketStatus.BANNER, RocketStatus.COUNTDOWN] } })
       .exec();
-    let launched = 0;
-    for (const state of due) {
+    if (active.length > 0) {
+      this.log.log(`rocket sweep: ${active.length} room(s) mid-cycle`);
+    }
+    let advanced = 0;
+    for (const state of active) {
+      const before = `${state.status}:${state.launchQueue.length}`;
       try {
-        await this.launchOne(state, config);
-        launched += 1;
+        await this.advanceRoom(state, config, now);
+        if (`${state.status}:${state.launchQueue.length}` !== before) {
+          advanced += 1;
+        }
       } catch (err: any) {
         this.log.error(
-          `Launch failed for room ${state.roomId}: ${err?.message ?? err}`,
+          `Rocket sweep failed for room ${state.roomId}: ${err?.message ?? err}`,
+          err?.stack,
         );
       }
     }
-    return launched;
+    return advanced;
   }
 
-  /** Run a single launch — distribute rewards, advance the level. */
-  private async launchOne(
+  // ---- level helpers ----
+
+  private sortedLevels(config: RocketConfigDocument): RocketLevel[] {
+    return [...config.levels].sort((a, b) => a.level - b.level);
+  }
+
+  private levelThreshold(config: RocketConfigDocument, level: number): number {
+    return (
+      config.levels.find((l) => l.level === level)?.energyRequired ??
+      Number.POSITIVE_INFINITY
+    );
+  }
+
+  /** Next level number after `level`, wrapping to the first after the last. */
+  private nextLevelNumber(config: RocketConfigDocument, level: number): number {
+    const sorted = this.sortedLevels(config);
+    const idx = sorted.findIndex((l) => l.level === level);
+    if (idx < 0) return sorted[0].level;
+    return idx >= sorted.length - 1 ? sorted[0].level : sorted[idx + 1].level;
+  }
+
+  /** Snap `currentLevel` to the lowest configured level if it's gone missing
+   *  (admin removed/renumbered levels). Mutates `state` in memory only. */
+  private ensureValidLevel(
     state: RocketRoomStateDocument,
     config: RocketConfigDocument,
+  ): void {
+    if (!config.levels.some((l) => l.level === state.currentLevel)) {
+      state.currentLevel = this.sortedLevels(config)[0].level;
+    }
+  }
+
+  // ============================================================
+  // Phase machine — IDLE → BANNER → COUNTDOWN → launch → (next | IDLE)
+  // ============================================================
+
+  /**
+   * Advance one room's phase machine to `now`, riding through every due
+   * transition (e.g. countdown elapsed → launch → next rocket's banner).
+   * Bounded so it can't spin. Safe to call from the gift path and the cron
+   * at the same time — each transition is status-guarded, so only one wins.
+   */
+  async advanceRoom(
+    state: RocketRoomStateDocument,
+    config: RocketConfigDocument,
+    now: Date = new Date(),
   ): Promise<void> {
-    let lv = config.levels.find((l) => l.level === state.currentLevel);
-    if (!lv) {
-      // The saved level vanished from the config (admin edit) between the
-      // countdown flip and this sweep. Snap to the lowest configured level
-      // and launch that instead of dead-ending, so the room keeps cycling.
-      const lowest = config.levels.length
-        ? [...config.levels].sort((a, b) => a.level - b.level)[0]
-        : null;
-      if (!lowest) {
-        // No levels at all — nothing to launch. Park it.
-        await this.stateModel
-          .updateOne(
-            { _id: state._id, status: RocketStatus.COUNTDOWN },
-            { $set: { status: RocketStatus.COMPLETE } },
-          )
-          .exec();
-        return;
+    if (!config.enabled || config.levels.length === 0) return;
+    for (let guard = 0; guard < 25; guard++) {
+      const moved = await this.stepRoom(state, config, now);
+      if (!moved) break;
+    }
+  }
+
+  /** One phase transition. Returns true if it changed the room's state. */
+  private async stepRoom(
+    state: RocketRoomStateDocument,
+    config: RocketConfigDocument,
+    now: Date,
+  ): Promise<boolean> {
+    switch (state.status) {
+      case RocketStatus.IDLE:
+      case RocketStatus.COMPLETE: // legacy stuck state — treat as idle
+        return this.tryStartCycle(state, config);
+      case RocketStatus.BANNER: {
+        const dueAt =
+          (state.phaseStartedAt?.getTime() ?? 0) + config.bannerSeconds * 1000;
+        if (now.getTime() < dueAt) return false;
+        return this.startCountdown(state, config);
       }
-      state.currentLevel = lowest.level;
-      lv = lowest;
+      case RocketStatus.COUNTDOWN: {
+        const dueAt =
+          (state.phaseStartedAt?.getTime() ?? 0) +
+          config.launchCountdownSeconds * 1000;
+        if (now.getTime() < dueAt) return false;
+        return this.fireLaunch(state, config);
+      }
+      default:
+        return false;
     }
+  }
 
-    // 1. Resolve top-3 contributors (only those above threshold).
-    const sorted = [...state.contributions].sort(
-      (a, b) => b.energy - a.energy,
-    );
-    const top: Array<{
-      userId: Types.ObjectId;
-      rank: number;
-      energy: number;
-      coinsAwarded: number;
-    }> = [];
-    const fixedCoinPerRank = [lv.top1Coins, lv.top2Coins, lv.top3Coins];
-    for (let i = 0; i < Math.min(3, sorted.length); i++) {
-      const entry = sorted[i];
-      if (entry.energy < config.topContributionThreshold) break;
-      top.push({
-        userId: entry.userId,
-        rank: i + 1,
-        energy: entry.energy,
-        coinsAwarded: fixedCoinPerRank[i],
-      });
+  /**
+   * IDLE → BANNER. If fuel has filled the current level, resolve every
+   * currently-affordable level into the launch queue (consuming fuel and
+   * advancing/looping `currentLevel`), then start the banner for the head.
+   * Returns false if nothing is launchable yet.
+   */
+  private async tryStartCycle(
+    state: RocketRoomStateDocument,
+    config: RocketConfigDocument,
+  ): Promise<boolean> {
+    this.ensureValidLevel(state, config);
+
+    const queue = [...state.launchQueue];
+    let level = state.currentLevel;
+    let energy = state.currentEnergy;
+    // Pull as many whole levels as the fuel covers into the queue. Bounded so
+    // a pathologically huge gift can't build a runaway queue.
+    let added = 0;
+    while (energy >= this.levelThreshold(config, level) && added < 50) {
+      queue.push(level);
+      energy -= this.levelThreshold(config, level);
+      level = this.nextLevelNumber(config, level);
+      added += 1;
     }
+    if (queue.length === 0) return false; // still filling — nothing to launch
 
-    // 2. Pick random beneficiaries from active room members EXCLUDING
-    //    the top-3 (they already won fixed). Active = recent
-    //    RoomMember.lastSeenAt within the last hour.
-    const topIds = new Set(top.map((t) => t.userId.toString()));
-    const recentMembers = await this.memberModel
-      .find({
-        roomId: state.roomId,
-        lastSeenAt: { $gte: new Date(Date.now() - 60 * 60 * 1000) },
-      })
-      .select({ userId: 1 })
+    const head = queue[0];
+    const startedAt = new Date();
+    const res = await this.stateModel
+      .updateOne(
+        {
+          _id: state._id,
+          status: { $in: [RocketStatus.IDLE, RocketStatus.COMPLETE] },
+        },
+        {
+          $set: {
+            status: RocketStatus.BANNER,
+            launchQueue: queue,
+            currentLevel: level,
+            currentEnergy: energy,
+            phaseStartedAt: startedAt,
+            pendingLaunch: null,
+          },
+        },
+      )
       .exec();
-    const candidatePool = recentMembers
-      .map((m) => m.userId)
-      .filter((id): id is Types.ObjectId => id != null && !topIds.has(id.toString()));
+    if (res.modifiedCount === 0) return false; // lost the race to another caller
 
-    const pickCount = Math.min(lv.randomBeneficiaries, candidatePool.length);
-    const picked: Types.ObjectId[] = [];
-    if (pickCount > 0) {
-      // Fisher-Yates partial — shuffle the candidate pool, take first N.
-      const arr = [...candidatePool];
-      for (let i = arr.length - 1; i > 0 && i >= arr.length - pickCount; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [arr[i], arr[j]] = [arr[j], arr[i]];
-      }
-      picked.push(...arr.slice(arr.length - pickCount));
-    }
-    // Split the pool evenly among picked users; rounding leftover goes
-    // to user 0 (same pattern as Lucky Bag's tier distribution).
-    const randomBeneficiaries: Array<{
-      userId: Types.ObjectId;
-      coinsAwarded: number;
-    }> = [];
-    if (picked.length > 0) {
-      const each = Math.floor(lv.randomPoolCoins / picked.length);
-      const leftover = lv.randomPoolCoins - each * picked.length;
-      for (let i = 0; i < picked.length; i++) {
-        randomBeneficiaries.push({
-          userId: picked[i],
-          coinsAwarded: each + (i === 0 ? leftover : 0),
-        });
-      }
+    state.status = RocketStatus.BANNER;
+    state.launchQueue = queue;
+    state.currentLevel = level;
+    state.currentEnergy = energy;
+    state.phaseStartedAt = startedAt;
+    state.pendingLaunch = null;
+
+    this.log.log(
+      `Rocket room ${state.roomId.toString()}: banner for Lv.${head} ` +
+        `(queue=[${queue.join(',')}], next-fill Lv.${level} @ ${energy})`,
+    );
+    await this.emitBanner(state, config, head);
+    await this.emitFuel(state, config);
+    return true;
+  }
+
+  /**
+   * BANNER → COUNTDOWN. The gather window elapsed: snapshot the present
+   * audience, compute this launch's winners from it (top-3 present + gate +
+   * random present), persist them, and start the in-room countdown — sending
+   * the Top-1's avatar so the countdown screen can show who's leading.
+   */
+  private async startCountdown(
+    state: RocketRoomStateDocument,
+    config: RocketConfigDocument,
+  ): Promise<boolean> {
+    const head = state.launchQueue[0];
+    const lv = config.levels.find((l) => l.level === head);
+    if (head == null || !lv) {
+      // Head level vanished (admin edit mid-cycle) — drop it.
+      return this.dropHeadAndContinue(state, config);
     }
 
-    // 3. Credit wallets. Idempotency keys are deterministic per
-    //    (state, launchSeq, level, userId) so a retry of the same launch
-    //    never double-credits, BUT a wrap-around launch of the same
-    //    level later in the day uses a distinct seq and thus distinct
-    //    idempotency keys — so the user gets their fresh reward.
-    const launchSeq = state.launches.length;
-    for (const t of top) {
+    const seq = state.launchSeq;
+    const { top, random } = await this.computeWinners(state, config, lv);
+    const pending = { level: head, seq, top, random };
+    const startedAt = new Date();
+
+    const res = await this.stateModel
+      .updateOne(
+        { _id: state._id, status: RocketStatus.BANNER },
+        {
+          $set: {
+            status: RocketStatus.COUNTDOWN,
+            phaseStartedAt: startedAt,
+            pendingLaunch: pending,
+          },
+        },
+      )
+      .exec();
+    if (res.modifiedCount === 0) return false;
+
+    state.status = RocketStatus.COUNTDOWN;
+    state.phaseStartedAt = startedAt;
+    state.pendingLaunch = pending as unknown as RocketRoomStateDocument['pendingLaunch'];
+
+    await this.emitCountdown(state, config, lv, top);
+    return true;
+  }
+
+  /**
+   * COUNTDOWN → launch. Pay the snapshotted winners, append the launch
+   * record, broadcast the launch animation + roster, then move to the next
+   * queued rocket's banner (or back to IDLE — where leftover fuel may start a
+   * fresh cycle on the next step).
+   */
+  private async fireLaunch(
+    state: RocketRoomStateDocument,
+    config: RocketConfigDocument,
+  ): Promise<boolean> {
+    const pending = state.pendingLaunch;
+    if (!pending) {
+      // No snapshot (shouldn't happen) — recover by dropping the head.
+      return this.dropHeadAndContinue(state, config);
+    }
+    const lv = config.levels.find((l) => l.level === pending.level) ?? null;
+
+    // 1. Pay winners. Idempotency keyed on the launch seq, so a retry never
+    //    double-pays, but a later loop of the same level (new seq) does pay.
+    for (const t of pending.top) {
       if (t.coinsAwarded <= 0) continue;
       try {
         await this.wallet.credit(Currency.COINS, {
           userId: t.userId.toString(),
           amount: t.coinsAwarded,
           type: TxnType.ROCKET_REWARD,
-          description: `Rocket Top-${t.rank} (Lv.${lv.level})`,
-          idempotencyKey: `rocket:top:${state._id.toString()}:${launchSeq}:${lv.level}:${t.userId.toString()}`,
+          description: `Rocket Top-${t.rank} (Lv.${pending.level})`,
+          idempotencyKey: `rocket:top:${state._id.toString()}:${pending.seq}:${pending.level}:${t.userId.toString()}`,
           refType: 'rocket',
           refId: state._id.toString(),
         });
@@ -612,15 +670,15 @@ export class RocketService {
         );
       }
     }
-    for (const r of randomBeneficiaries) {
+    for (const r of pending.random) {
       if (r.coinsAwarded <= 0) continue;
       try {
         await this.wallet.credit(Currency.COINS, {
           userId: r.userId.toString(),
           amount: r.coinsAwarded,
           type: TxnType.ROCKET_REWARD,
-          description: `Rocket random reward (Lv.${lv.level})`,
-          idempotencyKey: `rocket:rand:${state._id.toString()}:${launchSeq}:${lv.level}:${r.userId.toString()}`,
+          description: `Rocket random reward (Lv.${pending.level})`,
+          idempotencyKey: `rocket:rand:${state._id.toString()}:${pending.seq}:${pending.level}:${r.userId.toString()}`,
           refType: 'rocket',
           refId: state._id.toString(),
         });
@@ -631,192 +689,357 @@ export class RocketService {
       }
     }
 
-    // 4. Advance state — append the launch record, carry the residual
-    //    energy over to the next level. When the last level launches we
-    //    WRAP AROUND to L1 so the rocket keeps cycling all day; a huge
-    //    single gift can ride past the top of the ladder and start a
-    //    fresh round, bringing whatever's left over with it.
+    // 2. Advance: pop the head, append history, bump seq. The next queued
+    //    rocket (if any) goes straight to its BANNER; otherwise IDLE (where
+    //    the advance loop may immediately start a fresh cycle off leftover).
+    const queue = state.launchQueue.slice(1);
     const launchedAt = new Date();
-    const sortedLevels = [...config.levels].sort((a, b) => a.level - b.level);
-    const currentIdx = sortedLevels.findIndex((l) => l.level === lv.level);
-    const isLastLevel = currentIdx >= sortedLevels.length - 1;
-    const residualEnergy = Math.max(0, state.currentEnergy - lv.energyRequired);
-    // Sequential next level, or wrap to the first level if we just
-    // launched the last one. `nextLv` is non-null whenever there's at
-    // least one configured level (which we already verified above).
-    const nextLv = isLastLevel
-      ? sortedLevels[0]
-      : sortedLevels[currentIdx + 1];
-
-    const launchRecord = {
-      level: lv.level,
+    const record = {
+      level: pending.level,
       launchedAt,
-      topContributors: top,
-      randomBeneficiaries,
+      topContributors: pending.top,
+      randomBeneficiaries: pending.random,
     };
+    const nextStatus =
+      queue.length > 0 ? RocketStatus.BANNER : RocketStatus.IDLE;
+    const startedAt = queue.length > 0 ? launchedAt : null;
+    const newSeq = state.launchSeq + 1;
 
-    // Decide whether to immediately queue the NEXT level for cascade
-    // launch. The cascade fires `cascadeDelaySeconds` after THIS launch
-    // (config-tunable, default 30s). Wrap-around launches qualify too —
-    // a 1M coin gift on a 100K+300K+500K ladder will fire L1, L2, L3,
-    // then cascade L1 again with the leftover 100K.
-    let cascadeQueued = false;
-    let cascadeCountdownStartedAt: Date | null = null;
-    let cascadeNextLevel: number | null = null;
-    if (nextLv && residualEnergy >= nextLv.energyRequired) {
-      // The sweeper fires when
-      //   countdownStartedAt + launchCountdownSeconds <= now,
-      // so we set it back-dated such that the *due* time lands exactly
-      // `cascadeDelaySeconds` after THIS launch finished.
-      const cascadeDueAt = new Date(
-        launchedAt.getTime() + config.cascadeDelaySeconds * 1000,
-      );
-      cascadeCountdownStartedAt = new Date(
-        cascadeDueAt.getTime() - config.launchCountdownSeconds * 1000,
-      );
-      cascadeQueued = true;
-      cascadeNextLevel = nextLv.level;
-    }
-
-    await this.stateModel
+    const res = await this.stateModel
       .updateOne(
         { _id: state._id, status: RocketStatus.COUNTDOWN },
         {
           $set: {
-            status: cascadeQueued
-              ? RocketStatus.COUNTDOWN
-              : RocketStatus.IDLE,
-            currentLevel: nextLv.level,
-            currentEnergy: residualEnergy,
-            countdownStartedAt: cascadeQueued
-              ? cascadeCountdownStartedAt
-              : null,
+            status: nextStatus,
+            launchQueue: queue,
+            phaseStartedAt: startedAt,
+            pendingLaunch: null,
+            launchSeq: newSeq,
           },
-          $push: { launches: launchRecord },
+          $push: { launches: record },
         },
       )
       .exec();
+    if (res.modifiedCount === 0) return false;
 
-    const roomIdStr = state.roomId.toString();
+    state.status = nextStatus;
+    state.launchQueue = queue;
+    state.phaseStartedAt = startedAt;
+    state.pendingLaunch = null;
+    state.launchSeq = newSeq;
+    state.launches.push(
+      record as unknown as RocketRoomStateDocument['launches'][number],
+    );
 
-    // 5. Broadcast — room renders the explosion + reward roster, global
-    //    banner shows winners. Hydrate the winners' user docs so the
-    //    mobile launch overlay can render names + avatars without
-    //    falling back to "User <last-4-of-id>".
-    const winnerIds = [
-      ...top.map((t) => t.userId),
-      ...randomBeneficiaries.map((r) => r.userId),
+    this.log.log(
+      `Rocket room ${state.roomId.toString()}: LAUNCHED Lv.${pending.level} ` +
+        `(seq=${pending.seq}, remaining queue=[${queue.join(',')}])`,
+    );
+
+    await this.emitLaunched(state, config, lv, pending, queue);
+    if (queue.length > 0) await this.emitBanner(state, config, queue[0]);
+    await this.emitFuel(state, config);
+    return true;
+  }
+
+  /** Drop a head level that no longer exists in the config; re-banner the
+   *  next queued level or fall back to IDLE. */
+  private async dropHeadAndContinue(
+    state: RocketRoomStateDocument,
+    config: RocketConfigDocument,
+  ): Promise<boolean> {
+    const queue = state.launchQueue.slice(1);
+    const nextStatus =
+      queue.length > 0 ? RocketStatus.BANNER : RocketStatus.IDLE;
+    const startedAt = queue.length > 0 ? new Date() : null;
+    await this.stateModel
+      .updateOne(
+        {
+          _id: state._id,
+          status: { $in: [RocketStatus.BANNER, RocketStatus.COUNTDOWN] },
+        },
+        {
+          $set: {
+            status: nextStatus,
+            launchQueue: queue,
+            phaseStartedAt: startedAt,
+            pendingLaunch: null,
+          },
+        },
+      )
+      .exec();
+    state.status = nextStatus;
+    state.launchQueue = queue;
+    state.phaseStartedAt = startedAt;
+    state.pendingLaunch = null;
+    if (queue.length > 0) await this.emitBanner(state, config, queue[0]);
+    return true;
+  }
+
+  /**
+   * Snapshot the present audience and compute this launch's winners:
+   *   • Top-1/2/3 among PRESENT contributors that clear the gate.
+   *   • Random pool split among PRESENT non-top members.
+   * "Present" = a RoomMember row with a recent heartbeat (rows are removed on
+   * leave, so this is the live audience the banner gathered).
+   */
+  private async computeWinners(
+    state: RocketRoomStateDocument,
+    config: RocketConfigDocument,
+    lv: RocketLevel,
+  ): Promise<{
+    top: Array<{
+      userId: Types.ObjectId;
+      rank: number;
+      energy: number;
+      coinsAwarded: number;
+    }>;
+    random: Array<{ userId: Types.ObjectId; coinsAwarded: number }>;
+  }> {
+    const presentCutoff = new Date(Date.now() - PRESENCE_WINDOW_MS);
+    const members = await this.memberModel
+      .find({ roomId: state.roomId, lastSeenAt: { $gte: presentCutoff } })
+      .select({ userId: 1 })
+      .exec();
+    const presentIds = new Set(
+      members
+        .map((m) => m.userId?.toString())
+        .filter((id): id is string => !!id),
+    );
+
+    // Top-3: present contributors, ranked by contributed energy, gated.
+    const ranked = [...state.contributions]
+      .filter((c) => presentIds.has(c.userId.toString()))
+      .sort((a, b) => b.energy - a.energy);
+    const fixed = [lv.top1Coins, lv.top2Coins, lv.top3Coins];
+    const top: Array<{
+      userId: Types.ObjectId;
+      rank: number;
+      energy: number;
+      coinsAwarded: number;
+    }> = [];
+    for (let i = 0; i < Math.min(3, ranked.length); i++) {
+      if (ranked[i].energy < config.topContributionThreshold) break; // gate
+      top.push({
+        userId: ranked[i].userId,
+        rank: i + 1,
+        energy: ranked[i].energy,
+        coinsAwarded: fixed[i],
+      });
+    }
+
+    // Random: present members excluding the top-3.
+    const topIds = new Set(top.map((t) => t.userId.toString()));
+    const pool = [...presentIds]
+      .filter((id) => !topIds.has(id))
+      .map((id) => new Types.ObjectId(id));
+    const pickCount = Math.min(lv.randomBeneficiaries, pool.length);
+    for (let i = pool.length - 1; i > 0 && i >= pool.length - pickCount; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+    const picked = pool.slice(pool.length - pickCount);
+    const random: Array<{ userId: Types.ObjectId; coinsAwarded: number }> = [];
+    if (picked.length > 0) {
+      const each = Math.floor(lv.randomPoolCoins / picked.length);
+      const leftover = lv.randomPoolCoins - each * picked.length;
+      picked.forEach((id, i) =>
+        random.push({
+          userId: id,
+          coinsAwarded: each + (i === 0 ? leftover : 0),
+        }),
+      );
+    }
+    return { top, random };
+  }
+
+  // ---- broadcasts ----
+
+  private async emitBanner(
+    state: RocketRoomStateDocument,
+    config: RocketConfigDocument,
+    level: number,
+  ): Promise<void> {
+    const room = await this.roomModel
+      .findById(state.roomId)
+      .select({ name: 1, numericId: 1 })
+      .exec()
+      .catch(() => null);
+    const lv = config.levels.find((l) => l.level === level);
+    void this.realtime.emitGlobal(RealtimeEventType.GLOBAL_ROCKET_BANNER, {
+      roomId: state.roomId.toString(),
+      roomName: room?.name ?? '',
+      level,
+      // Distinct per launch so the app de-dupes per launch, not per level
+      // (the same level loops many times a day).
+      seq: state.launchSeq,
+      iconUrl: lv?.iconUrl ?? '',
+      assetUrl: lv?.assetUrl ?? '',
+      // Time from now until the animation: banner gather + countdown.
+      countdownSeconds: config.bannerSeconds + config.launchCountdownSeconds,
+      triggeredById: '',
+      triggeredByName: '',
+      triggeredByAvatarUrl: '',
+    });
+    // Room-scoped heads-up so clients ALREADY in the room start downloading
+    // the launch video during the banner window (no overlay yet) — by the
+    // time the countdown ends the video is on-device for smooth playback.
+    void this.realtime.emitToRoom(
+      state.roomId.toString(),
+      RealtimeEventType.ROOM_ROCKET_LAUNCH,
+      {
+        roomId: state.roomId.toString(),
+        level,
+        stage: 'banner',
+        assetUrl: lv?.assetUrl ?? '',
+        iconUrl: lv?.iconUrl ?? '',
+      },
+    );
+  }
+
+  private async emitCountdown(
+    state: RocketRoomStateDocument,
+    config: RocketConfigDocument,
+    lv: RocketLevel,
+    top: Array<{
+      userId: Types.ObjectId;
+      rank: number;
+      energy: number;
+      coinsAwarded: number;
+    }>,
+  ): Promise<void> {
+    const top1 = top.length > 0 ? await this.hydrateUser(top[0].userId) : null;
+    void this.realtime.emitToRoom(
+      state.roomId.toString(),
+      RealtimeEventType.ROOM_ROCKET_LAUNCH,
+      {
+        roomId: state.roomId.toString(),
+        level: lv.level,
+        stage: 'countdown',
+        assetUrl: lv.assetUrl,
+        iconUrl: lv.iconUrl,
+        countdownSeconds: config.launchCountdownSeconds,
+        // Leading contributor (from the present audience) — shown on the
+        // countdown screen so the crowd sees who's winning.
+        top1,
+      },
+    );
+  }
+
+  private async emitLaunched(
+    state: RocketRoomStateDocument,
+    config: RocketConfigDocument,
+    lv: RocketLevel | null,
+    pending: {
+      level: number;
+      top: Array<{
+        userId: Types.ObjectId;
+        rank: number;
+        energy: number;
+        coinsAwarded: number;
+      }>;
+      random: Array<{ userId: Types.ObjectId; coinsAwarded: number }>;
+    },
+    queue: number[],
+  ): Promise<void> {
+    const ids = [
+      ...pending.top.map((t) => t.userId),
+      ...pending.random.map((r) => r.userId),
     ];
-    const winnerUsers = winnerIds.length
+    const users = ids.length
       ? await this.userModel
-          .find({ _id: { $in: winnerIds } })
+          .find({ _id: { $in: ids } })
           .select({ username: 1, displayName: 1, avatarUrl: 1, numericId: 1 })
           .lean()
           .exec()
       : [];
-    const userMap = new Map<string, (typeof winnerUsers)[number]>();
-    for (const u of winnerUsers) {
-      userMap.set(u._id.toString(), u);
-    }
+    const map = new Map<string, (typeof users)[number]>();
+    for (const u of users) map.set(u._id.toString(), u);
     const hydrate = (userId: Types.ObjectId) => {
-      const u = userMap.get(userId.toString());
-      if (!u) return null;
-      return {
-        id: u._id.toString(),
-        username: u.username ?? '',
-        displayName: u.displayName ?? '',
-        avatarUrl: u.avatarUrl ?? '',
-        numericId: u.numericId ?? null,
-      };
+      const u = map.get(userId.toString());
+      return u
+        ? {
+            id: u._id.toString(),
+            username: u.username ?? '',
+            displayName: u.displayName ?? '',
+            avatarUrl: u.avatarUrl ?? '',
+            numericId: u.numericId ?? null,
+          }
+        : null;
     };
+    const sorted = this.sortedLevels(config);
+    const maxLevel = sorted.length
+      ? sorted[sorted.length - 1].level
+      : pending.level;
     void this.realtime.emitToRoom(
-      roomIdStr,
+      state.roomId.toString(),
       RealtimeEventType.ROOM_ROCKET_LAUNCH,
       {
-        roomId: roomIdStr,
-        level: lv.level,
+        roomId: state.roomId.toString(),
+        level: pending.level,
         stage: 'launched',
-        // Launch animation + thumbnail for THIS level so the room can
-        // play the rocket overlay (SVGA / image). Admin sets these per
-        // level in the rocket config.
-        assetUrl: lv.assetUrl,
-        iconUrl: lv.iconUrl,
-        topContributors: top.map((t) => ({
+        assetUrl: lv?.assetUrl ?? '',
+        iconUrl: lv?.iconUrl ?? '',
+        topContributors: pending.top.map((t) => ({
           userId: t.userId.toString(),
           user: hydrate(t.userId),
           rank: t.rank,
           energy: t.energy,
           coinsAwarded: t.coinsAwarded,
         })),
-        randomBeneficiaries: randomBeneficiaries.map((r) => ({
+        randomBeneficiaries: pending.random.map((r) => ({
           userId: r.userId.toString(),
           user: hydrate(r.userId),
           coinsAwarded: r.coinsAwarded,
         })),
-        nextLevel: nextLv.level,
-        wrapped: isLastLevel,
+        // The level the gauge fills next, and how many more rockets wait.
+        nextLevel: state.currentLevel,
+        queued: queue.length,
+        wrapped: pending.level === maxLevel,
       },
     );
+  }
 
-    // Live fuel update for the new level — gauge resets to the residual.
+  private async emitFuel(
+    state: RocketRoomStateDocument,
+    config: RocketConfigDocument,
+  ): Promise<void> {
+    const lv = config.levels.find((l) => l.level === state.currentLevel);
+    if (!lv) return;
     void this.realtime.emitToRoom(
-      roomIdStr,
+      state.roomId.toString(),
       RealtimeEventType.ROOM_ROCKET_FUEL,
       {
-        roomId: roomIdStr,
-        level: nextLv.level,
-        currentEnergy: residualEnergy,
-        energyRequired: nextLv.energyRequired,
-        status: cascadeQueued
-          ? RocketStatus.COUNTDOWN
-          : RocketStatus.IDLE,
+        roomId: state.roomId.toString(),
+        level: state.currentLevel,
+        currentEnergy: state.currentEnergy,
+        energyRequired: lv.energyRequired,
+        status: state.status,
       },
     );
+  }
 
-    // Cascade banner — countdown event so the mobile flips its overlay
-    // to "Launching Lv.N+1 in X..." with the correct wait time.
-    if (cascadeQueued && cascadeNextLevel != null) {
-      const cascadeWaitSeconds = Math.max(
-        config.launchCountdownSeconds,
-        config.cascadeDelaySeconds,
-      );
-      void this.realtime.emitToRoom(
-        roomIdStr,
-        RealtimeEventType.ROOM_ROCKET_LAUNCH,
-        {
-          roomId: roomIdStr,
-          level: cascadeNextLevel,
-          countdownSeconds: config.cascadeDelaySeconds,
-          waitSeconds: cascadeWaitSeconds,
-          stage: 'countdown',
-          cascade: true,
-          // Next level's art so the room countdown can show the right
-          // rocket icon instead of the glyph fallback.
-          assetUrl: nextLv.assetUrl,
-          iconUrl: nextLv.iconUrl,
-        },
-      );
-      // Global cascade banner — same treatment as the first launch so
-      // anyone in another room sees the next rocket coming.
-      const room = await this.roomModel
-        .findById(state.roomId)
-        .select({ name: 1, numericId: 1 })
-        .exec()
-        .catch(() => null);
-      void this.realtime.emitGlobal(
-        RealtimeEventType.GLOBAL_ROCKET_BANNER,
-        {
-          roomId: roomIdStr,
-          roomName: room?.name ?? '',
-          level: cascadeNextLevel,
-          triggeredById: '',
-          triggeredByName: 'Cascade',
-          triggeredByAvatarUrl: '',
-          countdownSeconds: config.cascadeDelaySeconds,
-          cascade: true,
-        },
-      );
-    }
+  private async hydrateUser(userId: Types.ObjectId): Promise<{
+    id: string;
+    username: string;
+    displayName: string;
+    avatarUrl: string;
+    numericId: number | null;
+  } | null> {
+    const u = await this.userModel
+      .findById(userId)
+      .select({ username: 1, displayName: 1, avatarUrl: 1, numericId: 1 })
+      .lean()
+      .exec()
+      .catch(() => null);
+    if (!u) return null;
+    return {
+      id: u._id.toString(),
+      username: u.username ?? '',
+      displayName: u.displayName ?? '',
+      avatarUrl: u.avatarUrl ?? '',
+      numericId: u.numericId ?? null,
+    };
   }
 
   // ============================================================
@@ -830,24 +1053,27 @@ export class RocketService {
    * stale countdowns from before a server crash).
    */
   async dailyReset(): Promise<number> {
-    // Find any stale COUNTDOWN rows from older days and force-launch
-    // them so rewards aren't permanently held hostage by a crash.
+    // Force any rooms still mid-cycle from a previous day all the way to
+    // completion, so snapshotted rewards aren't held hostage by a crash.
     const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
     const stale = await this.stateModel
       .find({
-        status: RocketStatus.COUNTDOWN,
-        countdownStartedAt: { $lt: yesterday, $ne: null },
+        status: { $in: [RocketStatus.BANNER, RocketStatus.COUNTDOWN] },
+        phaseStartedAt: { $lt: yesterday, $ne: null },
       })
       .exec();
     const config = await this.getConfig();
+    // A far-future "now" makes every pending phase due, so the whole queue
+    // drains in a single advanceRoom pass.
+    const farFuture = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
     let recovered = 0;
     for (const s of stale) {
       try {
-        await this.launchOne(s, config);
+        await this.advanceRoom(s, config, farFuture);
         recovered += 1;
       } catch (err: any) {
         this.log.error(
-          `Stale launch recovery failed for ${s._id}: ${err?.message ?? err}`,
+          `Stale rocket recovery failed for ${s._id}: ${err?.message ?? err}`,
         );
       }
     }

@@ -54,6 +54,7 @@ export class RocketController {
       enabled: config.enabled,
       timezone: config.timezone,
       topContributionThreshold: config.topContributionThreshold,
+      bannerSeconds: config.bannerSeconds,
       launchCountdownSeconds: config.launchCountdownSeconds,
       cascadeDelaySeconds: config.cascadeDelaySeconds,
       levels: config.levels,
