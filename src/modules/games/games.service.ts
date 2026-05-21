@@ -542,6 +542,120 @@ export class GamesService implements OnModuleInit {
   }
 
   /**
+   * Aggregate game economics over a time window, bucketed by day / week /
+   * month, for the admin analytics panel. Reports, per bucket and overall:
+   *   • users    — distinct players who bet
+   *   • wagered  — total coins bet ("Total coin")
+   *   • won      — total paid out to players ("Win coin")
+   *   • loss     — coins wagered on LOSING bets ("Loss coin")
+   *   • profit   — house take = wagered − won ("Admin profit")
+   *
+   * Sourced from GameBet, so it covers the retained window only (bets are
+   * pruned after 30 days). `days` is clamped to that window.
+   */
+  async getStats(params: {
+    granularity: 'day' | 'week' | 'month';
+    gameKey?: string;
+    currency?: 'coins' | 'diamonds';
+    days?: number;
+  }): Promise<{
+    granularity: 'day' | 'week' | 'month';
+    rangeDays: number;
+    summary: {
+      users: number;
+      wagered: number;
+      won: number;
+      loss: number;
+      profit: number;
+      bets: number;
+    };
+    buckets: Array<{
+      period: string;
+      users: number;
+      wagered: number;
+      won: number;
+      loss: number;
+      profit: number;
+      bets: number;
+    }>;
+  }> {
+    // Bets are pruned at 30 days, so there's no point looking back further.
+    const days = Math.min(31, Math.max(1, Math.floor(params.days ?? 30)));
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const tz = 'Asia/Dhaka';
+    const fmt =
+      params.granularity === 'month'
+        ? '%Y-%m'
+        : params.granularity === 'week'
+          ? '%G-W%V' // ISO year + ISO week number
+          : '%Y-%m-%d';
+
+    const match: Record<string, unknown> = { createdAt: { $gte: since } };
+    if (params.gameKey) match.gameKey = params.gameKey;
+    if (params.currency) match.currency = params.currency;
+
+    // Shared per-row metric accumulators.
+    const metrics = {
+      wagered: { $sum: '$amount' },
+      won: { $sum: '$payoutAmount' },
+      loss: { $sum: { $cond: [{ $eq: ['$payoutAmount', 0] }, '$amount', 0] } },
+      bets: { $sum: 1 },
+      users: { $addToSet: '$userId' },
+    };
+    const project = {
+      _id: 0,
+      wagered: 1,
+      won: 1,
+      loss: 1,
+      bets: 1,
+      users: { $size: '$users' },
+      profit: { $subtract: ['$wagered', '$won'] },
+    };
+
+    const [bucketRows, summaryRows] = await Promise.all([
+      this.betModel
+        .aggregate([
+          { $match: match },
+          {
+            $group: {
+              _id: {
+                $dateToString: { format: fmt, date: '$createdAt', timezone: tz },
+              },
+              ...metrics,
+            },
+          },
+          { $project: { ...project, period: '$_id' } },
+          { $sort: { period: 1 } },
+        ])
+        .allowDiskUse(true)
+        .exec(),
+      this.betModel
+        .aggregate([
+          { $match: match },
+          { $group: { _id: null, ...metrics } },
+          { $project: project },
+        ])
+        .allowDiskUse(true)
+        .exec(),
+    ]);
+
+    const s = (summaryRows[0] as Record<string, number> | undefined) ?? {};
+    return {
+      granularity: params.granularity,
+      rangeDays: days,
+      summary: {
+        users: s.users ?? 0,
+        wagered: s.wagered ?? 0,
+        won: s.won ?? 0,
+        loss: s.loss ?? 0,
+        profit: s.profit ?? 0,
+        bets: s.bets ?? 0,
+      },
+      buckets: bucketRows as any,
+    };
+  }
+
+  /**
    * Retention: delete game history (bets + rounds) older than
    * `olderThanDays` (default 30). Deletes in bounded batches so a huge
    * backlog never locks the DB with one giant `deleteMany`. The wallet

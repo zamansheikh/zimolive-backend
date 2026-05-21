@@ -311,6 +311,30 @@ export class GamesAdminController {
    * Lives under a 3-segment path so it never collides with the
    * `:gameKey/...` routes above.
    */
+  /**
+   * Game economics analytics for the admin panel — users / total coin /
+   * win coin / loss coin / admin profit, bucketed by day|week|month over the
+   * retained (≤30 day) window. Optional `gameKey` + `currency` filters.
+   */
+  @Get('stats')
+  async stats(
+    @Query('granularity') granularity?: string,
+    @Query('gameKey') gameKey?: string,
+    @Query('currency') currency?: string,
+    @Query('days') days?: string,
+  ) {
+    const g: 'day' | 'week' | 'month' =
+      granularity === 'week' || granularity === 'month' ? granularity : 'day';
+    const cur =
+      currency === 'diamonds' || currency === 'coins' ? currency : undefined;
+    return this.svc.getStats({
+      granularity: g,
+      gameKey: gameKey || undefined,
+      currency: cur,
+      days: days ? parseInt(days, 10) : undefined,
+    });
+  }
+
   @Get('history/user/:userId')
   async userHistory(
     @Param('userId') userId: string,
