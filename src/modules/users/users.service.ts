@@ -297,6 +297,23 @@ export class UsersService {
     return { items, page, limit, total };
   }
 
+  /**
+   * Distinct country codes present across users, with a per-country user
+   * count, sorted most-populous first. Powers the admin "filter by country"
+   * dropdown so it only lists countries that actually have users. Cheap
+   * aggregation over the indexed `country` field.
+   */
+  async distinctCountries(): Promise<Array<{ country: string; count: number }>> {
+    const rows = await this.userModel
+      .aggregate<{ _id: string; count: number }>([
+        { $match: { country: { $nin: [null, ''] } } },
+        { $group: { _id: '$country', count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+      ])
+      .exec();
+    return rows.map((r) => ({ country: r._id, count: r.count }));
+  }
+
   async ban(id: string, reason: string, bannedBy?: string): Promise<UserDocument> {
     const user = await this.getByIdOrThrow(id);
     user.status = UserStatus.BANNED;

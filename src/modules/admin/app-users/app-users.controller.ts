@@ -43,6 +43,15 @@ export class AppUsersController {
     return this.users.list({ page, limit, status, isHost: isHostBool, country, search });
   }
 
+  /** Distinct countries (with counts) for the App Users country filter.
+   *  Declared before `:id` so the literal path isn't captured as an id. */
+  @RequirePermissions(PERMISSIONS.USERS_VIEW)
+  @Get('countries')
+  async countries() {
+    const countries = await this.users.distinctCountries();
+    return { countries };
+  }
+
   @RequirePermissions(PERMISSIONS.USERS_VIEW)
   @Get(':id')
   async getOne(@Param('id') id: string) {
