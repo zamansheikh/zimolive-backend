@@ -104,6 +104,33 @@ export class WalletService {
     return this.walletModel.findOne({ userId: new Types.ObjectId(userId) }).exec();
   }
 
+  /**
+   * Coin/diamond balances for many users in one query — used to enrich list
+   * views (e.g. the admin App Users table) without an N+1 fetch. Users with
+   * no wallet row simply don't appear in the map (treat as 0).
+   */
+  async balancesByUserIds(
+    userIds: string[],
+  ): Promise<Map<string, { coins: number; diamonds: number }>> {
+    const ids = userIds
+      .filter((id) => Types.ObjectId.isValid(id))
+      .map((id) => new Types.ObjectId(id));
+    const out = new Map<string, { coins: number; diamonds: number }>();
+    if (ids.length === 0) return out;
+    const rows = await this.walletModel
+      .find({ userId: { $in: ids } })
+      .select({ userId: 1, coins: 1, diamonds: 1 })
+      .lean()
+      .exec();
+    for (const w of rows) {
+      out.set(w.userId.toString(), {
+        coins: w.coins ?? 0,
+        diamonds: w.diamonds ?? 0,
+      });
+    }
+    return out;
+  }
+
   async list(params: { page?: number; limit?: number; minCoins?: number; minDiamonds?: number }) {
     const page = Math.max(1, params.page ?? 1);
     const limit = Math.min(100, Math.max(1, params.limit ?? 20));

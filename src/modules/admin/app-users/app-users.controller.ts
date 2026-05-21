@@ -11,6 +11,7 @@ import {
 
 import { UserStatus } from '../../users/schemas/user.schema';
 import { UsersService } from '../../users/users.service';
+import { WalletService } from '../../wallet/wallet.service';
 import { AdminOnly } from '../admin-auth/decorators/admin-only.decorator';
 import { CurrentAdmin } from '../admin-auth/decorators/current-admin.decorator';
 import { RequirePermissions } from '../admin-auth/decorators/require-permissions.decorator';
@@ -27,6 +28,7 @@ export class AppUsersController {
   constructor(
     private readonly users: UsersService,
     private readonly adminUsers: AdminUsersService,
+    private readonly wallet: WalletService,
   ) {}
 
   @RequirePermissions(PERMISSIONS.USERS_VIEW)
@@ -40,7 +42,26 @@ export class AppUsersController {
     @Query('search') search?: string,
   ) {
     const isHostBool = isHost === undefined ? undefined : isHost === 'true';
-    return this.users.list({ page, limit, status, isHost: isHostBool, country, search });
+    const res = await this.users.list({
+      page,
+      limit,
+      status,
+      isHost: isHostBool,
+      country,
+      search,
+    });
+    // Enrich each row with its wallet balance (one batched query) so the
+    // admin list can show coins/diamonds without an N+1 per-user fetch.
+    const ids = res.items.map((u) => u._id.toString());
+    const balances = await this.wallet.balancesByUserIds(ids);
+    const items = res.items.map((u) => {
+      const json = u.toJSON() as Record<string, unknown>;
+      const bal = balances.get(u._id.toString());
+      json.coins = bal?.coins ?? 0;
+      json.diamonds = bal?.diamonds ?? 0;
+      return json;
+    });
+    return { ...res, items };
   }
 
   /** Distinct countries (with counts) for the App Users country filter.
